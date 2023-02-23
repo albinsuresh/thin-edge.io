@@ -376,6 +376,7 @@
 mod actors;
 pub mod builders;
 pub mod channels;
+pub mod connector;
 mod errors;
 pub mod keyed_messages;
 pub mod message_boxes;

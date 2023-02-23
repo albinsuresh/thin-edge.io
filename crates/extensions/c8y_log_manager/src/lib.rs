@@ -6,6 +6,7 @@ use actor::*;
 use c8y_http_proxy::handle::C8YHttpProxy;
 use c8y_http_proxy::C8YConnectionBuilder;
 pub use config::*;
+use tedge_actors::connector;
 use tedge_actors::futures::channel::mpsc;
 use tedge_actors::Builder;
 use tedge_actors::DynSender;
@@ -59,9 +60,11 @@ impl LogManagerBuilder {
     pub fn with_mqtt_connection(&mut self, mqtt: &mut MqttActorBuilder) -> Result<(), LinkError> {
         let subscriptions = vec!["c8y/s/ds"].try_into().unwrap();
         //Register peers symmetrically here
-        mqtt.register_peer(subscriptions, self.events_sender.clone().into());
-        self.register_peer(NoConfig, mqtt.get_sender());
-        Ok(())
+        // mqtt.register_peer(subscriptions, self.events_sender.clone().into());
+        // self.register_peer(NoConfig, mqtt.get_sender());
+
+        connector::connect_two_way(self, NoConfig, mqtt, subscriptions)
+        // Ok(())
     }
 
     pub fn with_fs_connection(
@@ -69,9 +72,10 @@ impl LogManagerBuilder {
         fs_builder: &mut FsWatchActorBuilder,
     ) -> Result<(), LinkError> {
         let config_dir = self.config.config_dir.clone();
-        fs_builder.register_peer(config_dir, self.events_sender.clone().into());
+        // fs_builder.register_peer(config_dir, self.events_sender.clone().into());
 
-        Ok(())
+        connector::connect_one_way(fs_builder, self, config_dir)
+        // Ok(())
     }
 }
 

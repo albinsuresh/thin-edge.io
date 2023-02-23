@@ -70,6 +70,10 @@ pub trait MessageSource<M: Message, Config> {
     fn register_peer(&mut self, config: Config, sender: DynSender<M>);
 }
 
+pub trait MessageSourceSink<Input: Message, Output: Message, Config>: MessageSource<Output, Config> + MessageSink<Input> {}
+
+impl<Input: Message, Output: Message, Config, T: MessageSource<Output, Config> + MessageSink<Input>> MessageSourceSink<Input, Output, Config> for T {}
+
 /// The builder of a MessageBox must implement this trait to receive requests from the runtime
 pub trait RuntimeRequestSink {
     /// Return the sender that can be used by the runtime to send requests to this actor
