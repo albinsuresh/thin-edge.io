@@ -19,10 +19,10 @@ The responsibilities of the child device connector are:
 
 Handling the above mentioned responsibilities involves
 multiple interactions with thin-edge over its MQTT and HTTP APIs.
-In cases, where the child device connector is installed alongside thin-edge on the same device,
+In cases where the child device connector is installed alongside thin-edge on the same device,
 these APIs can be accessed via a local IP or even `127.0.0.1`.
 The MQTT APIs are exposed via port 1883 and the HTTP APIs are exposed via port 8000, by default.
-But, when the child device connector is running directly on the external child device,
+When the child device connector is running directly on the external child device,
 the MQTT and HTTP APIs of thin-edge need to be accessed over the network using its IP address and ports,
 which are configured using the tedge config settings `mqtt.client.host` or `mqtt.client.port` for MQTT
 and `http.address` and `http.port` for HTTP.
@@ -57,10 +57,10 @@ it is ready to serve firmware update requests received from Cumulocity via thin-
 Handling firmware update requests from thin-edge is a 5-step process:
 
 1. Subscribe to, and receive firmware update requests via MQTT
-1. Send an “executing” operation status update to acknowledge the receipt of the request via MQTT
+1. Send an "executing" operation status update to acknowledge the receipt of the request via MQTT
 1. Download the firmware file update from the URL received in the request via HTTP
 1. Apply the firmware file update on the child device
-1. Send a “successful” operation status update via MQTT
+1. Send a "successful" operation status update via MQTT
 
 The following sections cover these steps in detail.
 
@@ -103,15 +103,15 @@ These requests arrive in the following JSON format:
 }
 ```
 
-The fields in the request are:
-* `id`: A unique id for the request. All responses must be sent back with the same id.
-* `attempt`: This `attempt` count can be used to differentiate between fresh requests and re-sent requests,
-  as this `attempt` count will be higher than `1` if the same request is resent from thin-edge on rare occasions
-  (e.g: thin-edge gets restarted while the child device is processing a firmware request).
-* `name`: Name of the firmware package
-* `version`: Version of the firmware package
-* `sha256`: The SHA-256 checksum of the firmware binary served in the `url`
-  which can be used to verify the integrity of the downloaded package post-download.
+The fields in the request are describe below.
+
+|Property|Description|
+|--------|-----------|
+|id| A unique id for the request. All responses must be sent back with the same id.|
+|attempt| This `attempt` count can be used to differentiate between fresh requests and re-sent requests, as this `attempt` count will be higher than `1` if the same request is resent from thin-edge on rare occasions (e.g: thin-edge gets restarted while the child device is processing a firmware request).|
+|name| Name of the firmware package|
+|version| Version of the firmware package|
+|sha256| The SHA-256 checksum of the firmware binary served in the `url` which can be used to verify the integrity of the downloaded package post-download.|
 
 ### Send executing response via MQTT
 
@@ -196,7 +196,7 @@ mosquitto_pub -h {TEDGE_DEVICE_IP} -t "tedge/{CHILD_ID}/commands/res/firmware_up
 ## Cleanup
 
 To save bandwidth, thin-edge downloads a single firmware file only once and keeps it cached for reuse across multiple child devices,
-as firmware updates are typically applied to a fleet of devices together.
+as firmware updates could be applied to a fleet of devices together.
 The cached files are stored under the tedge data directory `/var/tedge/cache`, by default.
 Since thin-edge does not know how many devices it will be reused for and for how long, it can not clean them up on its own.
 So, the user must manually delete the cached firmware files once the update is complete on all child devices.
@@ -206,4 +206,3 @@ So, the user must manually delete the cached firmware files once the update is c
 * Reference implementation of a [child device connector](https://github.com/thin-edge/thin-edge.io_examples/tree/main/child-device-agent) written in Python to demonstrate the contract described in this document.
 This connector supports both configuration and firmware management operations.
 So, just focus on the firmware management aspects.
-
