@@ -83,57 +83,106 @@ This section is divided into 3 parts:
 
 The topics for the thin-edge device, the services running on it and child devices have different prefixes:
 
-For parent: tedge/main/
+For parent: tedge/main/<device-id>
 For services: tedge/service/<service-id>
 For immediate child devices: tedge/child/<child-id>
-For nested child devices: tedge/child/<child-id>
+For nested child devices: tedge/descendent/<child-id>
 
 #### Telemetry
 
 For telemetry data, the topics would be grouped under a `telemetry/` sub-topic as follows:
-* Measurements: `tedge/main/telemetry/measurements`, `tedge/child/<child-id>/telemetry/measurements` etc
-* Events: `tedge/main/telemetry/events/<event-type>`, `tedge/service/<service-id>/telemetry/events/<event-type>` etc
-* Alarms: `tedge/main/telemetry/alarms/<alarm-type>/<severity>`, `tedge/service/<service-id>/telemetry/<alarm-type>/<severity>` etc
+* Measurements: `tedge/main/<device-id>/telemetry/measurements`
+* Events: `tedge/main/<device-id>/telemetry/events/<event-type>`
+* Alarms: `tedge/main/<device-id>/telemetry/alarms/<alarm-type>/<severity>`
 
 For child devices and services, a similar structure is followed like: `tedge/child/<child-id>/telemetry/measurements`,
 `tedge/service/<service-id>/telemetry/events/<event-type>` etc
 
+The subtopic levels `main/<device-id>` are really not required for the main device.
+They are added just for the sake of consistency with child devices and services so that
+it is easier to make queries like "subscribe to all measurements from all devices and services"
+which can be achieved with a wildcard subscription on `tedge/+/<device-id>/telemetry/measurements`.
+If this is not desired, then we can simplify it to just `tedge/telemetry/measurements`.
+
 #### Commands
 
 Similarly, all commands would be grouped under a `commands/` sub-topic as follows:
-For requests: `tedge/main/commands/req/<operation-type>/<operation-specific-keys>...`
-For responses: `tedge/main/commands/res/<operation-type>/<operation-specific-keys>...`
+For requests: `tedge/main/<device-id>/commands/req/<operation-type>/<operation-specific-keys>...`
+For responses: `tedge/main/<device-id>/commands/res/<operation-type>/<operation-specific-keys>...`
 
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
 Examples:
-* Software list operation: `tedge/main/commands/req/software_list` and `tedge/main/commands/res/software_list`
-* Software update operation `tedge/main/commands/req/software_update` and `tedge/main/commands/res/software_update`
-* Firmware update operation `tedge/main/commands/req/firmware_update` and `tedge/main/commands/res/firmware_update`
-* Device restart operation `tedge/main/commands/req/device_restart` and `tedge/main/commands/res/device_restart`
-* Configuration snapshot operation `tedge/main/commands/req/config_snapshot` and `tedge/main/commands/res/config_snapshot`
-* Configuration update operation `tedge/main/commands/req/config_update` and `tedge/main/commands/res/config_update`
+* Software list operation: `tedge/main/<device-id>/commands/req/software_list` and `tedge/main/<device-id>/commands/res/software_list`
+* Software update operation `tedge/main/<device-id>/commands/req/software_update` and `tedge/main/<device-id>/commands/res/software_update`
+* Firmware update operation `tedge/main/<device-id>/commands/req/firmware_update` and `tedge/main/<device-id>/commands/res/firmware_update`
+* Device restart operation `tedge/main/<device-id>/commands/req/device_restart` and `tedge/main/<device-id>/commands/res/device_restart`
+* Configuration snapshot operation `tedge/main/<device-id>/commands/req/config_snapshot` and `tedge/main/<device-id>/commands/res/config_snapshot`
+* Configuration update operation `tedge/main/<device-id>/commands/req/config_update` and `tedge/main/<device-id>/commands/res/config_update`
 
 Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
 further additions are possible in future if desired for a given operation type.
-For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
+For e.g: `tedge/main/<device-id>/commands/req/config_update/<config-type>` to address a specific `config-type`
 
 Similarly, for the response topics, another variation that supports multiple response types is also feasible, as follows:
-`tedge/main/commands/<res-type>/<op-type>`
+`tedge/main/<device-id>/commands/<res-type>/<op-type>`
 
 Examples:
-* `tedge/main/commands/executing/config_update`
-* `tedge/main/commands/successful/config_update`
-* `tedge/main/commands/failed/config_update`
+* `tedge/main/<device-id>/commands/executing/config_update`
+* `tedge/main/<device-id>/commands/successful/config_update`
+* `tedge/main/<device-id>/commands/failed/config_update`
+
+Child devices follow a similar structure for commands as well:
+* `tedge/child/<child-id>/commands/req/software_list`
+* `tedge/child/<child-id>/commands/res/software_update`
 
 #### Nested child devices
 
-TBD
+Immediate and nested child devices can be registered with thin-edge using its registration service,
+by sending the following MQTT message to the topic: `tedge/main/init/child/req/<child-id>`:
 
-#### Dynamic registration
+```json
+{ "parent": "<parent-device-id>" }
+```
 
-Dynamic registration is only supported for services and immediate child devices.
-Explicit registration is mandatory for hierarchical child devices.
+The `parent-device-id` is the device-id of the direct parent that the child device is connected to.
+The payload can have other fields describing the capabilities of that device as well (config management, software management etc).
+
+```admonish warning
+The exact topic keys and payload format for this init contract can be discussed and refined separately.
+The focus here is just on the MQTT topic structure.
+```
+
+Thin-edge needs to maintain the lineage (hierarchy of parent devices) of all descendent child devices in its internal state,
+so that it can be looked up while receiving any data from them.
+Even though the child device only declares its immediate parent in the registration message,
+the entire lineage can be traced back with a recursive lookup on that `parent-device-id`.
+
+The registration status, whether the device registration succeeded or not, is sent back on `tedge/main/init/child/res/<child-id>`,
+with the internal device id used by thin-edge to uniquely identify that device as follows:
+
+```json
+{ "status": "successful" }
+```
+
+A failure is indicated with a failed status: `{ "status": "failed" }`.
+
+Similarly, a service can register itself by sending the init message to `tedge/main/init/service/req/<service-id>`
+and expect the response on `tedge/main/init/service/res/<service-id>`.
+
+Once the registration is complete, these nested child devices can use the `tedge/descendent/<child-id>` topic prefix
+to send telemetry data or receive commands as follows:
+
+* Measurement: `tedge/descendent/<child-id>/telemetry/measurements`
+* Command: `tedge/descendent/<child-id>/commands/req/software_list`
+
+#### Automatic registration
+
+Even though an explicit registration is always desired,
+automatic registration is also supported for services and immediate child devices of the thin-edge device,
+on the receipt of the very first message from them.
+But, this automatic registration is not supported for descendent child devices.
+An explicit registration is mandatory for them.
 
 **Pros**
 
