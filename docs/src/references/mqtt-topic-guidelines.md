@@ -16,7 +16,16 @@ Here are a few such examples:
 
 ... where there is inconsistency in the placement of child devices and how the commands are grouped.
 
+There are a few other limitations like the lack of support for services on the thin-edge device,
+difficulty in extending existing topics with additional sub-topics, etc
+which are detailed in the requirements section.
+
 ## Requirements
+
+This section is divided into 3 parts:
+1. Must-have: for the requirements that must be met by the proposed solutions
+2. Nice-to-have: these requirements are not mandatory, but the solution addressing more of these requirements would be a plus
+3. Out-of-scope: those that are relevant but out of scope for this design exercise
 
 ### Must-have
 
@@ -66,15 +75,65 @@ Here are a few such examples:
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
-1. 
+1. Services on child devices. Service support can be limited to thin-edge devices only.
 
 ## Proposals
 
 ### Dedicated topics for tedge device, services and child devices
 
-For parent:  tedge/main/
-For service:  tedge/service/<service-id>
-For child: tedge/child/<child-id>
+The topics for the thin-edge device, the services running on it and child devices have different prefixes:
+
+For parent: tedge/main/
+For services: tedge/service/<service-id>
+For immediate child devices: tedge/child/<child-id>
+For nested child devices: tedge/child/<child-id>
+
+#### Telemetry
+
+For telemetry data, the topics would be grouped under a `telemetry/` sub-topic as follows:
+* Measurements: `tedge/main/telemetry/measurements`, `tedge/child/<child-id>/telemetry/measurements` etc
+* Events: `tedge/main/telemetry/events/<event-type>`, `tedge/service/<service-id>/telemetry/events/<event-type>` etc
+* Alarms: `tedge/main/telemetry/alarms/<alarm-type>/<severity>`, `tedge/service/<service-id>/telemetry/<alarm-type>/<severity>` etc
+
+For child devices and services, a similar structure is followed like: `tedge/child/<child-id>/telemetry/measurements`,
+`tedge/service/<service-id>/telemetry/events/<event-type>` etc
+
+#### Commands
+
+Similarly, all commands would be grouped under a `commands/` sub-topic as follows:
+For requests: `tedge/main/commands/req/<operation-type>/<operation-specific-keys>...`
+For responses: `tedge/main/commands/res/<operation-type>/<operation-specific-keys>...`
+
+The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
+
+Examples:
+* Software list operation: `tedge/main/commands/req/software_list` and `tedge/main/commands/res/software_list`
+* Software update operation `tedge/main/commands/req/software_update` and `tedge/main/commands/res/software_update`
+* Firmware update operation `tedge/main/commands/req/firmware_update` and `tedge/main/commands/res/firmware_update`
+* Device restart operation `tedge/main/commands/req/device_restart` and `tedge/main/commands/res/device_restart`
+* Configuration snapshot operation `tedge/main/commands/req/config_snapshot` and `tedge/main/commands/res/config_snapshot`
+* Configuration update operation `tedge/main/commands/req/config_update` and `tedge/main/commands/res/config_update`
+
+Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
+further additions are possible in future if desired for a given operation type.
+For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
+
+Similarly, for the response topics, another variation that supports multiple response types is also feasible, as follows:
+`tedge/main/commands/<res-type>/<op-type>`
+
+Examples:
+* `tedge/main/commands/executing/config_update`
+* `tedge/main/commands/successful/config_update`
+* `tedge/main/commands/failed/config_update`
+
+#### Nested child devices
+
+TBD
+
+#### Dynamic registration
+
+Dynamic registration is only supported for services and immediate child devices.
+Explicit registration is mandatory for hierarchical child devices.
 
 **Pros**
 
@@ -86,11 +145,11 @@ For child: tedge/child/<child-id>
 
 ### Unified topics for every "thing"
 
-For everything: `tedge/<id>/...`
+Use the same topic prefix for everything including parent device, services, child devices etc as follows:
+`tedge/<id>/...`
 
 The `id` could be a device id, service id or child device id.
 The relation between who's the parent/child/service is defined only during the bootstrapping phase.
-
 `tedge/main` could be just used as an alias for `tedge/<tedge-device-id>`.
 
 **Pros**
