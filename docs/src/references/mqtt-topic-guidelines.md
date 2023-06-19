@@ -20,6 +20,10 @@ There are a few other limitations like the lack of support for services on the t
 difficulty in extending existing topics with additional sub-topics, etc
 which are detailed in the requirements section.
 
+## Use-cases
+
+TBD
+
 ## Requirements
 
 This section is divided into 3 parts:
@@ -69,7 +73,9 @@ This section is divided into 3 parts:
    in MQTT topics over their globally unique cloud IDs (typically very long and cumbersome) would be desired.
    Ideally, all translation between user-provided-ids and cloud-twin-ids should be done internally by thin-edge,
    as long as it doesn't adversely affect any data mapping cost at scale.
-
+1. Limit the topic levels to 7 as AWS IoT core has a [max limit of 7](https://docs.aws.amazon.com/whitepapers/latest/designing-mqtt-topics-aws-iot-core/mqtt-design-best-practices.html)
+1. Symmetric topics: It would be good to keep the subtopic levels symmetric so that the wildcard subscriptions like
+   "subscribe to all measurements from all devices and services" are easier.
 ### Out of scope
 
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
@@ -162,7 +168,10 @@ The registration status, whether the device registration succeeded or not, is se
 with the internal device id used by thin-edge to uniquely identify that device as follows:
 
 ```json
-{ "status": "successful" }
+{
+   "id": "<internal-id>",
+   "status": "successful" 
+}
 ```
 
 A failure is indicated with a failed status: `{ "status": "failed" }`.
@@ -173,8 +182,8 @@ and expect the response on `tedge/main/init/service/res/<service-id>`.
 Once the registration is complete, these nested child devices can use the `tedge/descendent/<child-id>` topic prefix
 to send telemetry data or receive commands as follows:
 
-* Measurement: `tedge/descendent/<child-id>/telemetry/measurements`
-* Command: `tedge/descendent/<child-id>/commands/req/software_list`
+* Measurement: `tedge/descendent/<internal-id>/telemetry/measurements`
+* Command: `tedge/descendent/<internal-id>/commands/req/software_list`
 
 #### Automatic registration
 
@@ -186,29 +195,48 @@ An explicit registration is mandatory for them.
 
 **Pros**
 
-1. 
+1. The context on whether the data is coming from the parent, a child or a service is clear from the topics.
+1. Automatic registration is possible at least for child devices and main device services.
 
 **Cons**
 
-1.
+1. No support for services on child devices.
+   Even though the support can be added, it would make the topics extremely long.
+   E.g: `tedge/child/<child-id>/service/<service-id>/telemetry/measurements`
+1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit fo AWS 
 
 ### Unified topics for every "thing"
 
-Use the same topic prefix for everything including parent device, services, child devices etc as follows:
-`tedge/<id>/...`
+Use just `id`s in the topic for everything: including parent device, child devices and services.
+with just the distinction between device or service as follows:
+`tedge/<context>/<id>/...`
 
-The `id` could be a device id, service id or child device id.
-The relation between who's the parent/child/service is defined only during the bootstrapping phase.
-`tedge/main` could be just used as an alias for `tedge/<tedge-device-id>`.
+For device(parent or child): `tedge/device/<id>/...`
+For services(on parent or child): `tedge/service/<id>/...`
+
+Examples:
+* Main device measurements: `tedge/device/<tedge-device-id>/telemetry/measurements`
+* Main device service measurements: `tedge/service/<service-id>/telemetry/measurements`
+* Child device measurements: `tedge/device/<child-device-id>/telemetry/measurements`
+* Child device service measurements: `tedge/service/<service-id>/telemetry/measurements`
+
+The `id` could be the main device id, service id or child device id.
+The relation between the "parent and its child device
+s" or "devices and the services linked to them"
+are defined only during the bootstrapping phase.
+
+```admonish note
+`tedge/device/main` could be just used as an alias for `tedge/device/<id>` for simplicity.
+```admonish note
 
 **Pros**
 
-1. The same code works everywhere, irrespective of context
+1. Due to the lack of distinction in the topics between parent devices and child devices,
+   it is easier to write code for "the device" irrespective of whether it is deployed as a parent or child.
 
 **Cons**
 
-1. Not easy to differentiate the context easily from the message
-1. Unable to filter messages like: only from child devices  or only from services, excluding parent
-1. Bootstrapping becomes more critical
-1. 
-
+1. Not easy to differentiate the context(from parent or child) easily from the message.
+1. The `id`s must be unique between all devices and services in a deployment
+1. Not easy to do subscriptions like: "measurements only from child devices or only from services, excluding parent"
+1. No automatic registration as bootstrapping is mandatory
