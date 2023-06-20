@@ -20,6 +20,49 @@ There are a few other limitations like the lack of support for services on the t
 difficulty in extending existing topics with additional sub-topics, etc
 which are detailed in the requirements section.
 
+## Domain model influence
+
+The MQTT topics and interactions are modelled around the following entities:
+
+1. **Device**
+   A device can be viewed as a composition of hardware components and firmware/software components running on it.
+   The device can extract data from these hardware components and emit that as telemetry data using some software on it.
+   The device can also control these hardware components using some software.
+   The device also manages the firmware and all the software running on it.
+   A device could be connected to many other devices as well as multiple cloud providers/instances.
+1. **Tedge device**
+   The gateway device that is connected to the cloud, where thin-edge.io is installed,
+   which emits its own telemetry data and can receive commands to perform operations on the device.
+2. **Child device**
+   Typically, a different device that is connected to the tedge device, which has its own identity
+   which is separate from the tedge device itself.
+   It also emits its own measurements and can receive commands.
+   A child device need not always be a a physical device, but can also be a logical one,
+   abstracting some parts or groups of parts of the main device as well, with its own identity.
+   A child device can have further nested child devices as well.
+3. **Service**
+   A service can be a component or a piece of software running on a device (tedge device or child device).
+   For example, a device can have a cloud connector/agent software that can be viewed as a service.
+   Any software on the device can be modelled as a service, if monitoring them separately from the device makes sense.
+   A service can have its own telemetry data which is separate from the device's telemetry data.
+   For e.g: a service running on a device can report its own RAM or disk usage,
+   which is separate from the device's overall RAM or disk usage.
+   But services are managed (installed, updated etc) by the device that it is running on and hence
+   services not support commands on their own.
+   All commands meant for a service are received and managed by the device that it is running on.
+   For e.g: It would be much easier for the device to update/uninstall a service than expecting the service to update itself.
+   But, thin-edge does not completely rule out the possibility of services supporting commands as well, in future.
+   Unlike devices that only has a connectivity status, services have a liveness aspect to them as well,
+   which conveys if a service is up and running at any given point of time.
+   The liveness of services could be critical to the functioning of that device.
+   a service does not support nested services.
+   When a service is removed from a device, all telemetry data associated with it are obsolete as well, and hence removed.
+
+When a thin-edge device receives telemetry data for itself or child devices or services running on any of them,
+it needs to identify their source so that they can be associated with their twins on the device as well as in the cloud.
+For all the MQTT communication, this source info can be part of either the topic or the payload.
+Having them in the topics is desired, as that enables easy filtering of messages for a given device or a subset of devices.
+
 ## Use-cases
 
 TBD
@@ -33,9 +76,11 @@ This section is divided into 3 parts:
 
 ### Must-have
 
-1. A topic structure to receive telemetry data from services running on the main device,
+1. The topics must capture the source of that data that is exchanged through that message:
+   whether it came from the tedge device, a child device or a service on any one of them.
+1. A topic structure to receive telemetry data from services running on a device (main or child),
    which can't be associated to the main device or some child device,
-   but must be associated to a logical service entity that is linked to the main device.
+   but must be associated to a logical service entity that is linked to that device.
 1. Consistency in the topic structures for the main device, child device and services
 1. Support nested child devices so that telemetry data and commands can be received from/sent to child devices of child devices.
    deployments with at least 3 levels of nesting: a thin-edge device, its children and grand-children are not uncommon.
@@ -81,7 +126,7 @@ This section is divided into 3 parts:
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
-1. Services on child devices. Service support can be limited to thin-edge devices only.
+1. Ability to run multiple thin-edge instances connected to the same remote MQTT broker but managing their own set of isolated child devices.
 
 ## Proposals
 
@@ -203,7 +248,7 @@ An explicit registration is mandatory for them.
 1. No support for services on child devices.
    Even though the support can be added, it would make the topics extremely long.
    E.g: `tedge/child/<child-id>/service/<service-id>/telemetry/measurements`
-1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit fo AWS 
+1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit of AWS.
 
 ### Unified topics for every "thing"
 
@@ -211,8 +256,10 @@ Use just `id`s in the topic for everything: including parent device, child devic
 with just the distinction between device or service as follows:
 `tedge/<context>/<id>/...`
 
-For device(parent or child): `tedge/device/<id>/...`
-For services(on parent or child): `tedge/service/<id>/...`
+For tedge device: `tedge/main-device/<id>/...`
+For child device: `tedge/child-device/<id>/...`
+For services on tedge device: `tedge/main-service/<id>/...`
+For services on child device: `tedge/child-service/<id>/...`
 
 Examples:
 * Main device measurements: `tedge/device/<tedge-device-id>/telemetry/measurements`
@@ -221,8 +268,7 @@ Examples:
 * Child device service measurements: `tedge/service/<service-id>/telemetry/measurements`
 
 The `id` could be the main device id, service id or child device id.
-The relation between the "parent and its child device
-s" or "devices and the services linked to them"
+The relation between the "parent and its child devices" or "devices and the services linked to them"
 are defined only during the bootstrapping phase.
 
 ```admonish note
@@ -237,6 +283,9 @@ are defined only during the bootstrapping phase.
 **Cons**
 
 1. Not easy to differentiate the context(from parent or child) easily from the message.
-1. The `id`s must be unique between all devices and services in a deployment
+1. The `id`s must be unique between all devices and services in a deployment.
 1. Not easy to do subscriptions like: "measurements only from child devices or only from services, excluding parent"
+1. Difficult to do any subscriptions like "measurements from all services on a given child device",
+   without keeping track of all the `id`s of services registered with that child device.
+   Wild card subscriptions are not possible at all.
 1. No automatic registration as bootstrapping is mandatory
