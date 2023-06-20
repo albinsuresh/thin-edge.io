@@ -65,7 +65,39 @@ Having them in the topics is desired, as that enables easy filtering of messages
 
 ## Use-cases
 
-TBD
+1. Support for nested child devices.
+   A deployment where a gateway device is connected to a PLC which is further connected to other sensors/devices is very common.
+   There are 3 levels of devices even in this simple deployment which a user might want to replicate in his cloud view as well.
+   More complex deployments where a PLC is further connected to more PLCs which are further connected to leaf sensors/actuators
+   would require even more levels of nesting.
+1. Monitor the liveness of a piece of software running on a device (tedge or child) from the cloud.
+1. Gather the usage metrics of a software component(service) running on a device as measurements pushed to the cloud,
+   associated to an entity representing that software linked to that device, and not the device itself.
+   An identity separate from the device is key here to ease the management of that component from the cloud.
+   It is also required so that when that component is removed from the device, all data associated with it is removed as well.
+   It must be linked to a device as software component does not have independent existence and is managed by a device.
+   When a device is removed, all services linked to it are removed as well, as they're obsolete without the device.
+1. When data from services, connected child devices and even the tedge device itself, are flowing through the MQTT broker,
+   it must be easy to identify and filter the messages based on the source.
+   A few examples of filtering queries are:
+   * All measurements from a specific service
+   * All measurements from the tedge device only, excluding the ones from other services and child devices
+   * All measurements from all connected child devices
+   * All measurements from everything (the tedge device itself, its services and child devices and their services)
+1. Service ids must be namespaced under each device as it is highly likely that
+   the same type of service may have the same name on multiple/all devices.
+   It would be really difficult to maintain uniqueness in service name across an large fleet of devices.
+1. Child device ids also must be namespaced under their direct parent
+   so that conflicts can be avoided even if another parent device has child devices with the same id.
+   It is okay to expect all devices connected to a device to have unique ids,
+   but expecting those to be unique across an entire fleet could be far-fetched.
+1. When multiple child devices are connected to a tedge device,
+   a given child device should only be able to send/receive data meant for itself and not a sibling child device.
+   Thin-edge must provide this isolation in such a way that the peer child devices can not even view others' data.
+1. Connect to multiple cloud instances at the same time.
+   This is a common deployment model for SEMs, where the devices that they produce are labelled and sold by solution providers to end customers.
+   The device will be connected to the solution provider's cloud to gather all business data from the customer.
+   But, it might have to be connected simultaneously to the SEMs cloud as well so that the SEM can remotely manage that device (for maintenance).
 
 ## Requirements
 
