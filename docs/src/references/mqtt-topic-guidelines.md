@@ -44,19 +44,24 @@ The MQTT topics and interactions are modelled around the following entities:
    A service can be a component or a piece of software running on a device (tedge device or child device).
    For example, a device can have a cloud connector/agent software that can be viewed as a service.
    Any software on the device can be modelled as a service, if monitoring them separately from the device makes sense.
+   This abstraction be also be used to isolate various aspects of the device itself into separate groups, but still linked to the device.
+   For example, if you model a car as a device, the sensor data coming from different tyres, breaks, engine, infotainment system etc
+   can be isolated into their own respective services (more like light-weight child devices).
+
    A service can have its own telemetry data which is separate from the device's telemetry data.
    For e.g: a service running on a device can report its own RAM or disk usage,
    which is separate from the device's overall RAM or disk usage.
-   But services are managed (installed, updated etc) by the device that it is running on and hence
-   services not support commands on their own.
-   All commands meant for a service are received and managed by the device that it is running on.
+   The services are also usually managed (installed, updated etc) by the device that it is running on and hence
+   all commands meant for services are received and managed by that device.
    For e.g: It would be much easier for the device to update/uninstall a service than expecting the service to update itself.
-   But, thin-edge does not completely rule out the possibility of services supporting commands as well, in future.
+   But, thin-edge does not completely rule out the possibility of services handling commands on their own as well, in future.
+   When a service is removed from a device, all data associated with it are obsolete as well, and hence removed.
+
    Unlike devices that only has a connectivity status, services have a liveness aspect to them as well,
    which conveys if a service is up and running at any given point of time.
    The liveness of services could be critical to the functioning of that device.
-   a service does not support nested services.
-   When a service is removed from a device, all telemetry data associated with it are obsolete as well, and hence removed.
+
+   A service does not support nested services either.
 
 When a thin-edge device receives telemetry data for itself or child devices or services running on any of them,
 it needs to identify their source so that they can be associated with their twins on the device as well as in the cloud.
@@ -70,6 +75,10 @@ Having them in the topics is desired, as that enables easy filtering of messages
    There are 3 levels of devices even in this simple deployment which a user might want to replicate in his cloud view as well.
    More complex deployments where a PLC is further connected to more PLCs which are further connected to leaf sensors/actuators
    would require even more levels of nesting.
+   When a child device has its own nested child devices, it is expected that the parent child device sends/receives data
+   on behalf of all its direct children.
+   So, there must be a way for a child device to subscribe for all data meant for itself and its own child devices,
+   excluding its siblings and their child devices.
 1. Monitor the liveness of a piece of software running on a device (tedge or child) from the cloud.
 1. Gather the usage metrics of a software component(service) running on a device as measurements pushed to the cloud,
    associated to an entity representing that software linked to that device, and not the device itself.
@@ -93,8 +102,10 @@ Having them in the topics is desired, as that enables easy filtering of messages
    but expecting those to be unique across an entire fleet could be far-fetched.
 1. When multiple child devices are connected to a tedge device,
    a given child device should only be able to send/receive data meant for itself and not a sibling child device.
-   Thin-edge must provide this isolation in such a way that the peer child devices can not even view others' data.
-1. Connect to multiple cloud instances at the same time.
+   Thin-edge must provide this isolation in such a way that the even peer child devices can not even view others' data.
+   But, when a child device has its own nested child devices, it is expected that
+   the parent child device sends/receives data on behalf of all its children.
+1. Connect to multiple cloud instances, even of the same provider, at the same time.
    This is a common deployment model for SEMs, where the devices that they produce are labelled and sold by solution providers to end customers.
    The device will be connected to the solution provider's cloud to gather all business data from the customer.
    But, it might have to be connected simultaneously to the SEMs cloud as well so that the SEM can remotely manage that device (for maintenance).
