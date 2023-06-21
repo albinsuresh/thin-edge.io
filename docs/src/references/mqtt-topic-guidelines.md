@@ -80,9 +80,11 @@ Having them in the topics is desired, as that enables easy filtering of messages
    So, there must be a way for a child device to subscribe for all data meant for itself and its own child devices,
    excluding its siblings and their child devices.
 1. Monitor the liveness of a piece of software running on a device (tedge or child) from the cloud.
+   Certain services running on a device could be critical to the overall functioning of that device.
+   Hence monitoring the health/liveness of these services also would be critical.
 1. Gather the usage metrics of a software component(service) running on a device as measurements pushed to the cloud,
    associated to an entity representing that software linked to that device, and not the device itself.
-   An identity separate from the device is key here to ease the management of that component from the cloud.
+   An identity separate from the device is key here, to ease the management of that component from the cloud.
    It is also required so that when that component is removed from the device, all data associated with it is removed as well.
    It must be linked to a device as software component does not have independent existence and is managed by a device.
    When a device is removed, all services linked to it are removed as well, as they're obsolete without the device.
@@ -93,6 +95,7 @@ Having them in the topics is desired, as that enables easy filtering of messages
    * All measurements from the tedge device only, excluding the ones from other services and child devices
    * All measurements from all connected child devices
    * All measurements from everything (the tedge device itself, its services and child devices and their services)
+   * All messages from a subset of child devices based on some filtering criteria (e.g: device-type, firmware version etc)
 1. Service ids must be namespaced under each device as it is highly likely that
    the same type of service may have the same name on multiple/all devices.
    It would be really difficult to maintain uniqueness in service name across an large fleet of devices.
@@ -100,6 +103,11 @@ Having them in the topics is desired, as that enables easy filtering of messages
    so that conflicts can be avoided even if another parent device has child devices with the same id.
    It is okay to expect all devices connected to a device to have unique ids,
    but expecting those to be unique across an entire fleet could be far-fetched.
+1. If all child devices in a fleet can not guarantee uniqueness in their IDs,
+   thin-edge must provide a "registration mechanism" for them to get their own unique IDs,
+   which they can use for all their HTTP/MQTT communications.
+1. Device registration must be optional if a fleet admin can guarantee unique IDs for all his devices.
+   When an explicit registration is optional, child devices get auto-registered on receipt of the the very first message from them.
 1. When multiple child devices are connected to a tedge device,
    a given child device should only be able to send/receive data meant for itself and not a sibling child device.
    Thin-edge must provide this isolation in such a way that the even peer child devices can not even view others' data.
@@ -108,7 +116,19 @@ Having them in the topics is desired, as that enables easy filtering of messages
 1. Connect to multiple cloud instances, even of the same provider, at the same time.
    This is a common deployment model for SEMs, where the devices that they produce are labelled and sold by solution providers to end customers.
    The device will be connected to the solution provider's cloud to gather all business data from the customer.
-   But, it might have to be connected simultaneously to the SEMs cloud as well so that the SEM can remotely manage that device (for maintenance).
+   But, it might have to be connected simultaneously to the SEM's cloud as well so that the SEM can remotely manage that device (for periodic maintenance).
+1. All the existing topics like `tedge/measurements`, `tedge/events` imply that the data received on these
+   must be forwarded to the cloud as well.
+   Currently there is no way to tell thin-edge to just route some data internally and not forward those to the cloud.
+   Since filtering and aggregation on the edge is a very common use-case, especially for local analytics, this is highly desired.
+
+
+## Assumptions
+
+1. When device IDs are used in topics for child devices, it is expected that all of them have unique IDs.
+   They can use the thin-edge registration service to get unique IDs assigned, if they don't have it on their own.
+   These IDs need not be globally unique or even unique across multiple thin-edge devices.
+   They just need to be unique under the tedge network that they are part of.
 
 ## Requirements
 
@@ -119,19 +139,17 @@ This section is divided into 3 parts:
 
 ### Must-have
 
-1. The topics must capture the source of that data that is exchanged through that message:
+1. All MQTT topics for main device, child device and services must start with a common prefix like `tedge/`,
+   so that all tedge traffic can be filtered out easily from all other data being exchanged over the MQTT broker.
+1. The MQTT messages must capture the source of that data that is exchanged through that message:
    whether it came from the tedge device, a child device or a service on any one of them.
-1. A topic structure to receive telemetry data from services running on a device (main or child),
-   which can't be associated to the main device or some child device,
-   but must be associated to a logical service entity that is linked to that device.
-1. Consistency in the topic structures for the main device, child device and services
-1. Support nested child devices so that telemetry data and commands can be received from/sent to child devices of child devices.
+   Keeping them in the topics would make source-based filtering of messages easier.
+1. A separate topic structure to exchange data with services running on a device (main or child)
+   which is different from the topics of the device itself.
+1. Support nested child devices so that telemetry data and commands can be exchanged with child devices of child devices.
    deployments with at least 3 levels of nesting: a thin-edge device, its children and grand-children are not uncommon.
-1. When device IDs are used in topics, it is expected that all nested child devices under a thin-edge device are unique.
-   They need not be globally unique or even unique across multiple thin-edge devices.
-1. If child devices can not ensure uniqueness in their IDs,
-   a registration step with thin-edge can be used to get unique IDs under the thin-edge namespace.
-   This registration step must be optional for devices with unique IDs.
+1. A registration service provided by thin-edge to provide unique IDs for requesting child devices.
+   This registration step must be optional for devices if they can guarantee unique IDs on their own.
 1. Support the following kinds of filtering with minimal effort (ideally with a single wildcard subscription):
    * All data from thin-edge device excluding everything else(other services and child devices)
    * All data from all child devices excluding those from thin-edge device and services
@@ -139,37 +157,44 @@ This section is divided into 3 parts:
    * All data from a specific child device excluding everything else
    * All data from a specific service excluding everything else
 1. The topic structure should be ACL friendly so that rules can be applied
-   to limit child devices and services to access only the data meant for them.
+   to limit devices and services to access only the data meant for them.
 1. Enable easier extension of topics with further topic suffixes in future:
    E.g: Support `type` in the topic for measurements like `tedge/measurements/{measurement-type}`
+   or config-type in the topic for config management command: `tedge/commands/req/config_update/<config-type>`
+1. Enable exchange of telemetry data just on the local bus, without it getting forwarded to the cloud.
+1. Thin-edge must be able to generate unique `id`s for child devices on the local network,
+   without consulting with the cloud.
+   The device registration service must work even if the tedge device is not connected to a cloud.
+   All translation between tedge-local-ids and cloud-twin-ids should be done internally by the cloud mapper.
+   It is okay for the mapper to use the same tedge-local-ids in the cloud, if they are unique enough.
+   But, the cloud IDs (typically very long and cumbersome) must not be exposed to the tedge network at any cost.
 
 ### Nice-to have
 
+1. Avoid using the device id in the topics for the main tedge device to keep those well-known topics simple.
+   Use aliases like `main` or `master` instead, if an identifier is really required.
+   Using `id`s for child devices might be unavoidable.
+1. Consistency/symmetry in the topic structures for the main device, child device and services.
+   For e.g: if the telemetry topic for a child device is like: `tedge/level2/level3/level4/telemetry/...`
+   it would be better if the `telemetry` subtopic is at the 5th level in the topics for the main device and services as well,
+   as that would make wildcard subscriptions like "all telemetry data from all sources" easier.
 1. Dynamic creation/registration of child devices on receipt of the very first data that they send.
    This is desired at least for immediate child devices, if not for further nested child devices.
 1. Easy to create static routing rules so that it is easy to map a local MQTT topic for a nested child device
    to the equivalent cloud topic for its twin.
-1. All the existing topics like `tedge/measurements`, `tedge/events` imply that the data received on these
-   must be forwarded to the cloud as well.
-   Currently there is no way to tell thin-edge to just route some data internally and not forward those to the cloud.
-   Since filtering and aggregation on the edge is a very common use-case, especially for local analytics, this is highly desired.
 1. It would be ideal if the context/source of data (tedge device, service or child device)
    can be understood from the topic directly.
    For e.g: a topic scheme like `tedge/main/{id}`, `tedge/service/{id}` and `tedge/child/{id}` is more user-friendly
    than a simpler context agnostic scheme like `tedge/{id}` where `id` can be for any "thing".
-1. Allowing the "things" in a local domain to use their user-friendly unique IDs (within the tedge namespace)
-   in MQTT topics over their globally unique cloud IDs (typically very long and cumbersome) would be desired.
-   Ideally, all translation between user-provided-ids and cloud-twin-ids should be done internally by thin-edge,
-   as long as it doesn't adversely affect any data mapping cost at scale.
 1. Limit the topic levels to 7 as AWS IoT core has a [max limit of 7](https://docs.aws.amazon.com/whitepapers/latest/designing-mqtt-topics-aws-iot-core/mqtt-design-best-practices.html)
-1. Symmetric topics: It would be good to keep the subtopic levels symmetric so that the wildcard subscriptions like
-   "subscribe to all measurements from all devices and services" are easier.
+1. Make the `tedge/` MQTT topic prefix configurable so that it can be changed in the rare event of a name clash.
+
 ### Out of scope
 
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
-1. Ability to run multiple thin-edge instances connected to the same remote MQTT broker but managing their own set of isolated child devices.
+
 
 ## Proposals
 
