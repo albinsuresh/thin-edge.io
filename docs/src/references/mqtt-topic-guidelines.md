@@ -125,13 +125,19 @@ Having them in the topics is desired, as that enables easy filtering of messages
    must be forwarded to the cloud as well.
    Currently there is no way to tell thin-edge to just route some data internally and not forward those to the cloud.
    Since filtering and aggregation on the edge is a very common use-case, especially for local analytics, this is highly desired.
-1. Enable thin-edge plugins/components to register themselves with thin-edge by declaring their capabilities.
+1. Enable thin-edge extensions/plugins to register themselves with thin-edge by declaring their capabilities(supported commands).
    Child devices also should be able to do the same so that thin-edge is aware of the supported capabilities of each child device,
    for routing and management of commands meant for them.
-
+1. Keeping the entire device hierarchy in each and every message sent by a device must be avoided,
+   as that data is highly redundant and could impact the message sizes badly (sometimes bigger than the payload itself).
+   When a device is sending its telemetry data, it shouldn't have to repeat its lineage each and every time.
 
 ## Assumptions
 
+1. All services under a given device will have unique ids, namespaced under that device id.
+   But the same service name might repeat under multiple devices.
+1. All child devices under a given device will have unique ids, namespaced under that device id.
+   But different child devices under different parents might have the same name.
 1. When device IDs are used in topics for child devices, it is expected that all of them have unique IDs.
    They can use the thin-edge registration service to get unique IDs assigned, if they don't have it on their own.
    These IDs need not be globally unique or even unique across multiple thin-edge devices.
@@ -180,6 +186,9 @@ This section is divided into 3 parts:
 1. A registration mechanism for thin-edge plugins to declare their capabilities and other necessary metadata to thin-edge.
 1. Enable a device to subscribe to all the data meant for itself, its services and all its descendent child devices.
    This subscription mechanism should prevent a device from subscribing to messages of all other devices.
+1. Avoid entire device hierarchy in message payloads to avoid sending redundant data every time some data is sent.
+   The parent hierarchy of a child device must be established only once, during its registration
+   and thin-edge must be able to map the parent hierarchy from its unique id from then on.
 
 ### Nice-to have
 
@@ -205,75 +214,94 @@ This section is divided into 3 parts:
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
-1. Make the `tedge/` MQTT topic prefix configurable so that it can be changed in the rare event of a name clash.
-   This might be easier to implement for thin-edge components, but harder to make the entire community follow.
 
 ## Proposals
 
-### Dedicated topics for tedge device, services and child devices
+### Proposal 1: Dedicated topics for devices and services
 
-The topics for the thin-edge device, the services running on it and child devices have different prefixes:
+Topics to have device id as the top level prefix with distinction on the target: device or service as in:
+`tedge/<device-id>/<target-type>/...`
 
-For parent: tedge/main/<device-id>
-For services: tedge/service/<service-id>
-For immediate child devices: tedge/child/<child-id>
-For nested child devices: tedge/descendent/<child-id>
+For tedge device: tedge/main/...
+For tedge device services: tedge/main/service/<service-id>/...
+For child devices: tedge/<child-id>/...
+For child device services: tedge/<child-id>/service/<service-id>/...
+
+... where `main` is used as an alias for the tedge device id.
 
 #### Telemetry
 
 For telemetry data, the topics would be grouped under a `telemetry/` sub-topic as follows:
-* Measurements: `tedge/main/<device-id>/telemetry/measurements`
-* Events: `tedge/main/<device-id>/telemetry/events/<event-type>`
-* Alarms: `tedge/main/<device-id>/telemetry/alarms/<alarm-type>/<severity>`
+* Measurements: `tedge/<device-id>/<target-type>/telemetry/measurements`
+* Events: `tedge/<device-id>/<target-type>/telemetry/events/<event-type>`
+* Alarms: `tedge/<device-id>/<target-type>/telemetry/alarms/<alarm-type>/<severity>`
 
-For child devices and services, a similar structure is followed like: `tedge/child/<child-id>/telemetry/measurements`,
-`tedge/service/<service-id>/telemetry/events/<event-type>` etc
+Examples:
+For tedge device: `tedge/main/telemetry/measurements`
+For tedge device services: `tedge/main/service/<service-id>/telemetry/measurements`
+For child devices: `tedge/<child-id>/telemetry/measurements`
+For device services: `tedge/<child-id>/service/<service-id>/telemetry/measurements`
 
-The subtopic levels `main/<device-id>` are really not required for the main device.
-They are added just for the sake of consistency with child devices and services so that
-it is easier to make queries like "subscribe to all measurements from all devices and services"
-which can be achieved with a wildcard subscription on `tedge/+/<device-id>/telemetry/measurements`.
-If this is not desired, then we can simplify it to just `tedge/telemetry/measurements`.
+**Why have the redundant `/telemetry` subtopic level?**
+To have a clear separation from commands or other kinds of data that might get added in future.
+It simplifies subscriptions for "all telemetry data from a device" to just `tedge/<device-id>/+/telemetry/#`.
+Without that `telemetry` grouping level, doing such a subscription would be difficult as you you'll have to subscribe to
+`tedge/<device-id>/+/measurements/#`, `tedge/<device-id>/+/events/#` and `tedge/<device-id>/+/alarms/#` separately.
+Something simpler like `tedge/<device-id>/+/#` would cover a lot more than just telemetry data: commands as well.
+It also eases defining ACL rules for telemetry data separately from those of commands.
+
+**Why have the `/service` subtopic level and not have the <service-id> directly?**
+Primarily for future-proofing as `service` is a new kind of child abstraction that we've added now.
+If another abstraction comes in the future, say `plugin`, they can be namespaced under a `plugin/` subtopic.
 
 #### Commands
 
 Similarly, all commands would be grouped under a `commands/` sub-topic as follows:
-For requests: `tedge/main/<device-id>/commands/req/<operation-type>/<operation-specific-keys>...`
-For responses: `tedge/main/<device-id>/commands/res/<operation-type>/<operation-specific-keys>...`
+
+For requests: `tedge/<device-id>/<target-type>/commands/req/<operation-type>/<operation-specific-keys>...`
+For responses: `tedge/<device-id>/<target-type>/commands/res/<operation-type>/<operation-specific-keys>...`
 
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
 Examples:
-* Software list operation: `tedge/main/<device-id>/commands/req/software_list` and `tedge/main/<device-id>/commands/res/software_list`
-* Software update operation `tedge/main/<device-id>/commands/req/software_update` and `tedge/main/<device-id>/commands/res/software_update`
-* Firmware update operation `tedge/main/<device-id>/commands/req/firmware_update` and `tedge/main/<device-id>/commands/res/firmware_update`
-* Device restart operation `tedge/main/<device-id>/commands/req/device_restart` and `tedge/main/<device-id>/commands/res/device_restart`
-* Configuration snapshot operation `tedge/main/<device-id>/commands/req/config_snapshot` and `tedge/main/<device-id>/commands/res/config_snapshot`
-* Configuration update operation `tedge/main/<device-id>/commands/req/config_update` and `tedge/main/<device-id>/commands/res/config_update`
+* Software list operation: `tedge/main/commands/req/software_list` and `tedge/main/commands/res/software_list`
+* Software update operation `tedge/<child-id>/commands/req/software_update` and `tedge/<child-id>/commands/res/software_update`
+* Firmware update operation `tedge/main/commands/req/firmware_update` and `tedge/main/commands/res/firmware_update`
+* Device restart operation `tedge/main/commands/req/device_restart` and `tedge/main/commands/res/device_restart`
+* Configuration snapshot operation `tedge/main/<service-id>/commands/req/config_snapshot` and `tedge/main/<service-id>/commands/res/config_snapshot`
+* Configuration update operation `tedge/<child-id>/<service-id>/commands/req/config_update` and `tedge/<child-id>/<service-id>/commands/res/config_update`
 
 Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
 further additions are possible in future if desired for a given operation type.
-For e.g: `tedge/main/<device-id>/commands/req/config_update/<config-type>` to address a specific `config-type`
+For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
 
 Similarly, for the response topics, another variation that supports multiple response types is also feasible, as follows:
-`tedge/main/<device-id>/commands/<res-type>/<op-type>`
+`tedge/main/commands/<res-type>/<op-type>`
 
 Examples:
-* `tedge/main/<device-id>/commands/executing/config_update`
-* `tedge/main/<device-id>/commands/successful/config_update`
-* `tedge/main/<device-id>/commands/failed/config_update`
+* `tedge/main/commands/executing/config_update`
+* `tedge/main/commands/successful/config_update`
+* `tedge/main/commands/failed/config_update`
 
 Child devices follow a similar structure for commands as well:
-* `tedge/child/<child-id>/commands/req/software_list`
-* `tedge/child/<child-id>/commands/res/software_update`
+* `tedge/<child-id>/commands/req/software_list`
+* `tedge/<child-id>/commands/res/software_update`
 
-#### Nested child devices
+#### Registration service for child devices
 
 Immediate and nested child devices can be registered with thin-edge using its registration service,
-by sending the following MQTT message to the topic: `tedge/main/init/child/req/<child-id>`:
+by sending the following MQTT message to the topic: `tedge/main/register/req/child`:
 
 ```json
-{ "parent": "<parent-device-id>" }
+{ 
+   "parent": "<parent-device-id>",
+   "id-prefix": "<desired-child-id-prefix>",
+   "capabilities": {
+      "<capability-1>": {},  //capability-1 specific metadata
+      "<capability-2>": {},  //capability-2 specific metadata
+      ...
+   }
+}
 ```
 
 The `parent-device-id` is the device-id of the direct parent that the child device is connected to.
@@ -289,22 +317,21 @@ so that it can be looked up while receiving any data from them.
 Even though the child device only declares its immediate parent in the registration message,
 the entire lineage can be traced back with a recursive lookup on that `parent-device-id`.
 
-The registration status, whether the device registration succeeded or not, is sent back on `tedge/main/init/child/res/<child-id>`,
+The registration status, whether the device registration succeeded or not, is sent back on `tedge/main/register/res/child`,
 with the internal device id used by thin-edge to uniquely identify that device as follows:
 
 ```json
 {
-   "id": "<internal-id>",
+   "id": "<generated-id>",
    "status": "successful" 
 }
 ```
 
+The `<generated-id>` will use the `<desired-child-id-prefix>` sent in the registration request.
+
 A failure is indicated with a failed status: `{ "status": "failed" }`.
 
-Similarly, a service can register itself by sending the init message to `tedge/main/init/service/req/<service-id>`
-and expect the response on `tedge/main/init/service/res/<service-id>`.
-
-Once the registration is complete, these nested child devices can use the `tedge/descendent/<child-id>` topic prefix
+Once the registration is complete, these nested child devices can use the `tedge/<generated-id>` topic prefix
 to send telemetry data or receive commands as follows:
 
 * Measurement: `tedge/descendent/<internal-id>/telemetry/measurements`
@@ -312,25 +339,34 @@ to send telemetry data or receive commands as follows:
 
 #### Automatic registration
 
-Even though an explicit registration is always desired,
-automatic registration is also supported for services and immediate child devices of the thin-edge device,
-on the receipt of the very first message from them.
-But, this automatic registration is not supported for descendent child devices.
-An explicit registration is mandatory for them.
+Automatic registration is supported for services as they are expected to have unique names under each device namespace,
+and they do not supporting nesting, eliminating any name clashes that way. 
+So, it is easier to associate those services with their parent devices, as the parent id is part of the topic.
+
+It can't be supported for child devices with this topic scheme as there's no distinction between
+immediate child devices and nested child devices in the topics.
+
+If it really needs to be supported, at least for immediate child devices,
+they need to declare somehow that they are immediate child devices or not,
+which can be done by adding that distinction in the topics as follows:
+
+* For immediate child devices: `tedge/child/<child-id>/...`
+* For nested child devices: `tedge/descendent/<child-id>/...`
+
+.. so that automatic registration can be done for everything coming from `tedge/child/...` topics.
+If keeping that information in the topics is not desired, it can be kept in the payload as well,
+with the caveat that defining static routing rules would not be possible with it.
 
 **Pros**
 
 1. The context on whether the data is coming from the parent, a child or a service is clear from the topics.
-1. Automatic registration is possible at least for child devices and main device services.
+1. Automatic registration is possible at least for services and even child devices with some tweaks.
 
 **Cons**
 
-1. No support for services on child devices.
-   Even though the support can be added, it would make the topics extremely long.
-   E.g: `tedge/child/<child-id>/service/<service-id>/telemetry/measurements`
 1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit of AWS.
 
-### Unified topics for every "thing"
+### Proposal 2: Unified topics for every "thing"
 
 Use just `id`s in the topic for everything: including parent device, child devices and services.
 with just the distinction between device or service as follows:
