@@ -3,14 +3,6 @@ use tedge_actors::ClientMessageBox;
 
 #[tokio::test]
 async fn get_over_https() {
-    let mut request_builder = http::Request::builder();
-
-    // Set request properties
-    request_builder = request_builder.method("GET").uri("https://example.com");
-
-    // Clone the request builder
-    let cloned_request_builder = request_builder.clone();
-
     let mut server = mockito::Server::new();
     let _mock = server.mock("GET", "/").create();
 
