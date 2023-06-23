@@ -215,6 +215,39 @@ This section is divided into 3 parts:
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
 
+## Example deployment
+
+Here is a sample deployment structure for a smart two-wheeler that is used in the examples below:
+
+```mermaid
+graph TD;
+    TEDGE --> CENTRAL-ECU-0001;
+    CENTRAL-ECU-0001 --> ENGINE-ECU-E001;
+    CENTRAL-ECU-0001 --> WHEEL-ECU-E001;
+    CENTRAL-ECU-0001 --> WHEEL-ECU-E002;
+
+    ENGINE-ECU-E001 --> TMP-0001((TMP-0001));
+
+    WHEEL-ECU-E001 --> BRAKE-ECU-A001;
+    WHEEL-ECU-E001 --> TYRE-ECU-T001;
+    BRAKE-ECU-A001 --> TMP-1001((TMP-0001));
+    TYRE-ECU-T001 --> TMP-1002((TMP-0002));
+    TYRE-ECU-T001 --> PRSR-1002((PRSR-0002));
+
+    WHEEL-ECU-E002 --> BRAKE-ECU-A001'[BRAKE-ECU-A001];
+    WHEEL-ECU-E002 --> TYRE-ECU-T002;
+    BRAKE-ECU-A001' --> TMP-1001'((TMP-0001));
+    TYRE-ECU-T002 --> TMP-1002'((TMP-0002));
+    TYRE-ECU-T002 --> PRSR-1002'((PRSR-0002));
+```
+
+As you can see, the ECUs for the front and rear wheels have unique IDs: `WHEEL-ECU-E001` and `WHEEL-ECU-E002`,
+as they exist at the same level, connected to the central ECU(`CENTRAL-ECU-0001`).
+But, the brake ECUs connected to both the wheels may have the same ID, as they are not linked directly anyway.
+Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TMP-0001`).
+
+So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
+
 ## Proposals
 
 ### Proposal 1: Dedicated topics for devices and services
@@ -341,7 +374,7 @@ to send telemetry data or receive commands as follows:
 
 Automatic registration is supported for services as they are expected to have unique names under each device namespace,
 and they do not supporting nesting, eliminating any name clashes that way. 
-So, it is easier to associate those services with their parent devices, as the parent id is part of the topic.
+So, it is easier to associate those services directly with their parent devices, as the parent id is part of the topic.
 
 It can't be supported for child devices with this topic scheme as there's no distinction between
 immediate child devices and nested child devices in the topics.
