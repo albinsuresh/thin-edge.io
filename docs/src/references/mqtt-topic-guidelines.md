@@ -258,7 +258,7 @@ So, the proposed solutions must address such ID clashes in a deep nested hierarc
 ### Proposal 1: Dedicated topics for devices and services
 
 This proposal is built on the following assumptions/constraints:
-* thin-edge can identify the child devices(the nested ones as well), and all the services with unique IDs.
+* thin-edge can identify the child devices (the nested ones as well), and all the services with unique IDs.
 * All child-devices connected to a parent device will have unique IDs under its parent namespace,
   but not necessarily across the entire tedge namespace/hierarchy.
 * If all child devices **can not** guarantee that uniqueness across the entire hierarchy,
@@ -271,37 +271,63 @@ This proposal is built on the following assumptions/constraints:
   They just need to have unique IDs under their parent's namespace.
 
 Topics to have device id as the top level prefix with distinction on the target: device or service as in:
-`tedge/<device-id>/<target-type>/...`
 
-For tedge device: tedge/main/...
-For tedge device services: tedge/main/service/<service-id>/...
-For child devices: tedge/<child-id>/...
-For child device services: tedge/<child-id>/service/<service-id>/...
+```
+tedge/<device-id>[/<target-type>]/...
+```
 
-... where `main` is used as an alias for the tedge device id.
+The following demonstrates the different topic prefix for each of the target types:
+
+|Target|Topic Prefix|
+|------|-------|
+|tedge device|`tedge/main/`|
+|service on tedge device|`tedge/main/service/`|
+|child device|`tedge/<child-id>/`|
+|service on child device|`tedge/<child-id>/service/<service-id>/`|
+
+Where `main` is used as an alias for the tedge device id.
 
 #### Telemetry
 
 For telemetry data, the topics would be grouped under a `telemetry/` sub-topic as follows:
-* Measurements: `tedge/<device-id>/<target-type>/telemetry/measurements`
-* Events: `tedge/<device-id>/<target-type>/telemetry/events/<event-type>`
-* Alarms: `tedge/<device-id>/<target-type>/telemetry/alarms/<alarm-type>/<severity>`
 
-Examples:
-For tedge device: `tedge/main/telemetry/measurements`
-For tedge device services: `tedge/main/service/<service-id>/telemetry/measurements`
-For child devices: `tedge/<child-id>/telemetry/measurements`
-For device services: `tedge/<child-id>/service/<service-id>/telemetry/measurements`
+|Type|Example|
+|------|-------|
+|Measurements|`<target_prefix>/telemetry/measurements`|
+|Events|`<target_prefix>/telemetry/events/<event-type>`|
+|Alarms|`<target_prefix>/telemetry/alarms/<alarm-type>/<severity>`|
+
+**Examples**
+
+The following shows an example of the measurement telemetry topics for each of the target types:
+
+|Target|Topic structure|
+|------|-------|
+|tedge device|`tedge/main/telemetry/measurements`|
+|service on tedge device|`tedge/main/service/<service-id>/telemetry/measurements`|
+|child device|`tedge/<child-id>/telemetry/measurements`|
+|service on child device|`tedge/<child-id>/service/<service-id>/telemetry/measurements`|
 
 **Why have the redundant `/telemetry` subtopic level?**
+
 To have a clear separation from commands or other kinds of data that might get added in future.
 It simplifies subscriptions for "all telemetry data from a device" to just `tedge/<device-id>/+/telemetry/#`.
-Without that `telemetry` grouping level, doing such a subscription would be difficult as you you'll have to subscribe to
-`tedge/<device-id>/+/measurements/#`, `tedge/<device-id>/+/events/#` and `tedge/<device-id>/+/alarms/#` separately.
-Something simpler like `tedge/<device-id>/+/#` would cover a lot more than just telemetry data: commands as well.
-It also eases defining ACL rules for telemetry data separately from those of commands.
+Without that `telemetry` grouping level, doing such a subscription would be difficult as you'll have to subscribe to each of the following topics separately:
+
+* `tedge/<device-id>/+/measurements/#`
+* `tedge/<device-id>/+/events/#`
+* `tedge/<device-id>/+/alarms/#`
+
+In additional, this topic structure allow to combine the subscription of telemetry data as well as command data via the following MQTT wildcard topic:
+
+```
+tedge/<device-id>/+/#
+```
+
+Creating ACL rules is also simplified by allowing telemetry data to be controlled independently to the command topics.
 
 **Why have the `/service` subtopic level and not have the <service-id> directly?**
+
 Primarily for future-proofing as `service` is a new kind of child abstraction that we've added now.
 If another abstraction comes in the future, say `plugin`, they can be namespaced under a `plugin/` subtopic.
 
@@ -315,20 +341,64 @@ For responses: `tedge/<device-id>/<target-type>/commands/res/<operation-type>/<o
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
 Examples:
-* Software list operation: `tedge/main/commands/req/software_list` and `tedge/main/commands/res/software_list`
-* Software update operation `tedge/<child-id>/commands/req/software_update` and `tedge/<child-id>/commands/res/software_update`
-* Firmware update operation `tedge/main/commands/req/firmware_update` and `tedge/main/commands/res/firmware_update`
-* Device restart operation `tedge/main/commands/req/device_restart` and `tedge/main/commands/res/device_restart`
-* Configuration snapshot operation `tedge/main/<service-id>/commands/req/config_snapshot` and `tedge/main/<service-id>/commands/res/config_snapshot`
-* Configuration update operation `tedge/<child-id>/<service-id>/commands/req/config_update` and `tedge/<child-id>/<service-id>/commands/res/config_update`
+
+* Software list operation
+
+   ```
+   tedge/main/commands/req/software_list
+   tedge/main/commands/res/software_list
+   ```
+
+* Software update operation
+
+   ```
+   tedge/<child-id>/commands/req/software_update
+   tedge/<child-id>/commands/res/software_update
+   ```
+
+* Firmware update operation
+
+   ```
+   tedge/main/commands/req/firmware_update
+   tedge/main/commands/res/firmware_update
+   ```
+
+* Device restart operation
+
+   ```
+   tedge/main/commands/req/device_restart
+   tedge/main/commands/res/device_restart
+   ```
+
+* Configuration snapshot operation
+
+   ```
+   tedge/main/<service-id>/commands/req/config_snapshot
+   tedge/main/<service-id>/commands/res/config_snapshot
+   ```
+
+* Configuration update operation
+
+   ```
+   tedge/<child-id>/<service-id>/commands/req/config_update
+   tedge/<child-id>/<service-id>/commands/res/config_update
+   ```
+
 
 Child devices follow a similar structure for commands as well:
-* `tedge/<child-id>/commands/req/software_list`
-* `tedge/<child-id>/commands/res/software_update`
+
+```
+tedge/<child-id>/commands/req/software_list
+tedge/<child-id>/commands/res/software_update
+```
+
 
 If command support is added to servcies in future, they'd follow a similar pattern as in:
-* `tedge/<device-id>/service/<service-id>/commands/req/software_list`
-* `tedge/<device-id>/service/<service-id>/commands/req/software_list`
+
+```
+tedge/<device-id>/service/<service-id>/commands/req/software_list
+tedge/<device-id>/service/<service-id>/commands/req/software_list
+```
 
 Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
 further additions are possible in future if desired for a given operation type.
@@ -381,8 +451,11 @@ A failure is indicated with a failed status: `{ "status": "failed" }`.
 Once the registration is complete, these nested child devices can use the `tedge/<generated-id>` topic prefix
 to send telemetry data or receive commands as follows:
 
-* Measurement: `tedge/descendent/<internal-id>/telemetry/measurements`
-* Command: `tedge/descendent/<internal-id>/commands/req/software_list`
+
+|Type|Topic structure|
+|----|---------------|
+|Measurement|`tedge/descendent/<internal-id>/telemetry/measurements`|
+|Command|`tedge/descendent/<internal-id>/commands/req/software_list`|
 
 #### Automatic registration
 
@@ -397,8 +470,11 @@ If it really needs to be supported, at least for immediate child devices,
 they need to declare somehow that they are immediate child devices or not,
 which can be done by adding that distinction in the topics as follows:
 
-* For immediate child devices: `tedge/child/<child-id>/...`
-* For nested child devices: `tedge/descendent/<child-id>/...`
+|Child type|Topic structure|
+|----|---------------|
+|(immediate) child device|`tedge/child/<child-id>/...`|
+|nested child device|`tedge/descendent/<child-id>/...`|
+
 
 .. so that automatic registration can be done for everything coming from `tedge/child/...` topics.
 If keeping that information in the topics is not desired, it can be kept in the payload as well,
