@@ -252,6 +252,19 @@ So, the proposed solutions must address such ID clashes in a deep nested hierarc
 
 ### Proposal 1: Dedicated topics for devices and services
 
+This proposal is built on the following assumptions/constraints:
+* thin-edge can identify the child devices(the nested ones as well), and all the services with unique IDs.
+* All child-devices connected to a parent device will have unique IDs under its parent namespace,
+  but not necessarily across the entire tedge namespace/hierarchy.
+* If all child devices **can not** guarantee that uniqueness across the entire hierarchy,
+  then they are expected to register with thin-edge to get that unique ID generated.
+* Given that unique ID, thin-edge can identify its entire parent lineage and descendent child devices.
+  Thin-edge internally maintains this mapping information as child devices register with it.
+* If all child devices **can** guarantee ID uniqueness across the entire hierarchy,
+  they can skip this registration step.
+* Services need not have unique IDs across the entire hierarchy.
+  They just need to have unique IDs under their parent's namespace.
+
 Topics to have device id as the top level prefix with distinction on the target: device or service as in:
 `tedge/<device-id>/<target-type>/...`
 
