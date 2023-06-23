@@ -131,6 +131,11 @@ Having them in the topics is desired, as that enables easy filtering of messages
 1. Keeping the entire device hierarchy in each and every message sent by a device must be avoided,
    as that data is highly redundant and could impact the message sizes badly (sometimes bigger than the payload itself).
    When a device is sending its telemetry data, it shouldn't have to repeat its lineage each and every time.
+1. When child devices have their own MQTT brokers on them, it is desired that all the messages received by that broker
+   can be routed to the tedge MQTT broker using some static routing rules defined on that child broker.
+   Especially, if tedge is running on those child devices as well, this must be feasible.
+   You can even assume a nested chain of MQTT brokers in a hierarchical deployment,
+   where each broker routes all traffic to its parent, which is further routed by that parent to its parent.
 
 ## Assumptions
 
@@ -189,6 +194,7 @@ This section is divided into 3 parts:
 1. Avoid entire device hierarchy in message payloads to avoid sending redundant data every time some data is sent.
    The parent hierarchy of a child device must be established only once, during its registration
    and thin-edge must be able to map the parent hierarchy from its unique id from then on.
+1. Easy to create static routing rules so that it is easy to map a local MQTT topic for a nested child device
 
 ### Nice-to have
 
@@ -201,7 +207,6 @@ This section is divided into 3 parts:
    as that would make wildcard subscriptions like "all telemetry data from all sources" easier.
 1. Dynamic creation/registration of child devices on receipt of the very first data that they send.
    This is desired at least for immediate child devices, if not for further nested child devices.
-1. Easy to create static routing rules so that it is easy to map a local MQTT topic for a nested child device
    to the equivalent cloud topic for its twin.
 1. It would be ideal if the context/source of data (tedge device, service or child device)
    can be understood from the topic directly.
@@ -317,21 +322,17 @@ Examples:
 * Configuration snapshot operation `tedge/main/<service-id>/commands/req/config_snapshot` and `tedge/main/<service-id>/commands/res/config_snapshot`
 * Configuration update operation `tedge/<child-id>/<service-id>/commands/req/config_update` and `tedge/<child-id>/<service-id>/commands/res/config_update`
 
-Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
-further additions are possible in future if desired for a given operation type.
-For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
-
-Similarly, for the response topics, another variation that supports multiple response types is also feasible, as follows:
-`tedge/main/commands/<res-type>/<op-type>`
-
-Examples:
-* `tedge/main/commands/executing/config_update`
-* `tedge/main/commands/successful/config_update`
-* `tedge/main/commands/failed/config_update`
-
 Child devices follow a similar structure for commands as well:
 * `tedge/<child-id>/commands/req/software_list`
 * `tedge/<child-id>/commands/res/software_update`
+
+If command support is added to servcies in future, they'd follow a similar pattern as in:
+* `tedge/<device-id>/service/<service-id>/commands/req/software_list`
+* `tedge/<device-id>/service/<service-id>/commands/req/software_list`
+
+Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
+further additions are possible in future if desired for a given operation type.
+For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
 
 #### Registration service for child devices
 
