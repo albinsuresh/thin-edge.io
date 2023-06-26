@@ -514,6 +514,47 @@ with the caveat that defining static routing rules would not be possible with it
 
 1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit of AWS.
 
+## Extended Proposal 1: Include parent id also in the topics
+
+Include the parent `id` information also in the topic as follows:
+
+```
+tedge/<parent-device-id>/<device-id>/<target-type>/...
+```
+
+Examples:
+
+|Target|Topic Prefix|
+|------|-------|
+|tedge device|`tedge/main/device/`|
+|service on tedge device|`tedge/main/service/<service-id>`|
+|immediate child device|`tedge/main/<child-id>/device/`|
+|descendent child device|`tedge/<parent-child-id>/<child-id>/`|
+|service on child device|`tedge/<child-id>/service/<service-id>/`|
+
+For the main device, there is no change as it is the root device,
+unless we want to make it more explicit and symmetric with a `root` prefix like `tedge/root/main/device/`
+
+**Pros**
+
+* When the parent device wants to subscribe to all data from its immediate child devices,
+  it can be done with a `tedge/<parent-child-id>/+/#` subscription.
+  This single subscription will work even when child devices are added dynamically.
+  Otherwise, the parent will have to subscribe for all child devices individually
+  and dynamically subscribe to new child topics, when new child devices are added.
+
+**Cons**
+
+* Topics are even longer for marginal gains.
+* Higher payload size, as the parent name is repeated in each and every message.
+* To subscribe for all nested child devices data as well, the parent will have to do dynamic subscriptions anyway
+  when a new nested child device is added.
+  For example, if a `parent` is already subscribed to `tedge/parent/+/#` for all child devices: `child-1` and `child-2`,
+  when a `child-3` is added, it will be covered with the existing subscription itself.
+  But, if these child devices have nested child devices, the parent will have to subscribe to,
+  `tedge/child-1/+/#` and `tedge/child-2/+/#` separately,
+  and when `child-3` is added, dynamically subscribe to `tedge/child-3/+/#` as well.
+
 ## Proposal 2: Unified topics for every "thing"
 
 This proposal is built on top of the following assumptions:
