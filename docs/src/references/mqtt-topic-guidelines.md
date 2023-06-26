@@ -331,9 +331,9 @@ The following shows an example of the measurement telemetry topics for each of t
 
 |Target|Topic structure|
 |------|-------|
-|tedge device|`tedge/main/telemetry/measurements`|
+|tedge device|`tedge/main/device/telemetry/measurements`|
 |service on tedge device|`tedge/main/service/<service-id>/telemetry/measurements`|
-|child device|`tedge/<child-id>/telemetry/measurements`|
+|child device|`tedge/<child-id>/device/telemetry/measurements`|
 |service on child device|`tedge/<child-id>/service/<service-id>/telemetry/measurements`|
 
 **Why have the redundant `/telemetry` subtopic level?**
@@ -365,51 +365,6 @@ Similarly, all commands would be grouped under a `commands/` sub-topic as follow
 
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
-Examples:
-
-* Software list operation
-
-   ```
-   tedge/main/commands/req/software_list
-   tedge/main/commands/res/software_list
-   ```
-
-* Software update operation
-
-   ```
-   tedge/<child-id>/commands/req/software_update
-   tedge/<child-id>/commands/res/software_update
-   ```
-
-* Firmware update operation
-
-   ```
-   tedge/main/commands/req/firmware_update
-   tedge/main/commands/res/firmware_update
-   ```
-
-* Device restart operation
-
-   ```
-   tedge/main/commands/req/device_restart
-   tedge/main/commands/res/device_restart
-   ```
-
-* Configuration snapshot operation
-
-   ```
-   tedge/main/<service-id>/commands/req/config_snapshot
-   tedge/main/<service-id>/commands/res/config_snapshot
-   ```
-
-* Configuration update operation
-
-   ```
-   tedge/<child-id>/<service-id>/commands/req/config_update
-   tedge/<child-id>/<service-id>/commands/res/config_update
-   ```
-
-
 Child devices follow a similar structure for commands as well:
 
 ```
@@ -424,6 +379,50 @@ If command support is added to services in future, they'd follow a similar patte
 tedge/<device-id>/service/<service-id>/commands/req/software_list
 tedge/<device-id>/service/<service-id>/commands/req/software_list
 ```
+
+**Examples:**
+
+* Software list operation
+
+   ```
+   tedge/main/device/commands/req/software_list
+   tedge/main/device/commands/res/software_list
+   ```
+
+* Software update operation
+
+   ```
+   tedge/<child-id>/device/commands/req/software_update
+   tedge/<child-id>/device/commands/res/software_update
+   ```
+
+* Firmware update operation
+
+   ```
+   tedge/main/device/commands/req/firmware_update
+   tedge/main/device/commands/res/firmware_update
+   ```
+
+* Device restart operation
+
+   ```
+   tedge/main/device/commands/req/device_restart
+   tedge/main/device/commands/res/device_restart
+   ```
+
+* Configuration snapshot operation
+
+   ```
+   tedge/main/service/<service-id>/commands/req/config_snapshot
+   tedge/main/service/<service-id>/commands/res/config_snapshot
+   ```
+
+* Configuration update operation
+
+   ```
+   tedge/<child-id>/service/<service-id>/commands/req/config_update
+   tedge/<child-id>/service/<service-id>/commands/res/config_update
+   ```
 
 Although all the above examples maintain consistent structure by ending with the `<operation-type>`,
 further additions are possible in future if desired for a given operation type.
@@ -600,3 +599,10 @@ Examples:
    without keeping track of all the `id`s of services registered with that child device.
    Easy wild card subscriptions are not possible at all.
 1. No automatic registration as bootstrapping is mandatory for everything.
+
+## Enhancements
+
+* Introduce a `tedge/self` topic that can be used by developers to write context-agnostic tedge components,
+  without worrying about device IDs and their context (whether deployed on main or child device).
+  The `tedge/self` prefix must be mapped to `tedge/main` on the main device and `tedge/<child-id>` on the child devices.
+  The "connection mechanism" (e.g `tedge connect` on main) can define this as a static mqtt routing rule on each device.
