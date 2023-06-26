@@ -514,42 +514,48 @@ with the caveat that defining static routing rules would not be possible with it
 
 1. The topics are fairly long and with extensions might easily cross the 7 sub-topic limit of AWS.
 
-### Proposal 2: Unified topics for every "thing"
+## Proposal 2: Unified topics for every "thing"
 
-Use just `id`s in the topic for everything: including parent device, child devices and services.
-with just the distinction between device or service as follows:
-`tedge/<context>/<id>/...`
+This proposal is built on top of the following assumptions:
+1. Every entity, a child device, descendent child devices or services, must register with thin-edge
+   to get their unique IDs generated, unless these entities can ensure uniqueness across the entire fleet.
+1. No dynamic registration for anything.
+1. Avoiding the entity type(device or service, child or descendent etc) from the topics reduces the payload size as well,
+   as the type of an entity needs to be declared only once and need not be repeated over and over for every message.
 
-For tedge device: `tedge/main-device/<id>/...`
-For child device: `tedge/child-device/<id>/...`
-For services on tedge device: `tedge/main-service/<id>/...`
-For services on child device: `tedge/child-service/<id>/...`
+The proposal is as follows:
+
+A topic scheme that doesn't differentiate between parent child devices or services and
+does not declare the parent-child relation in the topics either, as follows:
+
+```
+tedge/<entity-id>/...
+```
+
+...where `id` could be the `id` of the main device, child device or a service on any of them.
+The alias `main` can still be used for the main tedge device.
 
 Examples:
-* Main device measurements: `tedge/device/<tedge-device-id>/telemetry/measurements`
-* Main device service measurements: `tedge/service/<service-id>/telemetry/measurements`
-* Child device measurements: `tedge/device/<child-device-id>/telemetry/measurements`
-* Child device service measurements: `tedge/service/<service-id>/telemetry/measurements`
-
-The `id` could be the main device id, service id or child device id.
-The relation between the "parent and its child devices" or "devices and the services linked to them"
-are defined only during the bootstrapping phase.
+* Main device measurements: `tedge/<tedge-device-id>/telemetry/measurements`
+* Main device service measurements: `tedge/<service-id>/telemetry/measurements`
+* Child device measurements: `tedge/<child-device-id>/telemetry/measurements`
+* Child device service measurements: `tedge/<child-service-id>/telemetry/measurements`
 
 ```admonish note
-`tedge/device/main` could be just used as an alias for `tedge/device/<id>` for simplicity.
-```admonish note
+`tedge/main` could be just used as an alias for `tedge/<tedge-device-id>` for simplicity.
+```
 
 **Pros**
 
 1. Due to the lack of distinction in the topics between parent devices and child devices,
    it is easier to write code for "the device" irrespective of whether it is deployed as a parent or child.
+1. Minimal payload size as we're only including the `id`s everywhere without repeating any context info.
 
 **Cons**
 
 1. Not easy to differentiate the context(from parent or child) easily from the message.
 1. The `id`s must be unique between all devices and services in a deployment.
-1. Not easy to do subscriptions like: "measurements only from child devices or only from services, excluding parent"
-1. Difficult to do any subscriptions like "measurements from all services on a given child device",
+1. Not easy to do subscriptions like: "measurements only from child devices or only from services, excluding parent",
    without keeping track of all the `id`s of services registered with that child device.
-   Wild card subscriptions are not possible at all.
-1. No automatic registration as bootstrapping is mandatory
+   Easy wild card subscriptions are not possible at all.
+1. No automatic registration as bootstrapping is mandatory for everything.
