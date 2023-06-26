@@ -4,7 +4,7 @@ This document provides the guidelines for designing MQTT topic structures for th
 The goal is to provide a consistent structure so that future extensions are easy and natural.
 It should also help plugin/extension developers to define their topic schemes as well, inline with the tedge topics.
 
-## Background
+# Background
 
 The inconsistency in the existing topic schemes of thin-edge has long been a problem for both users and the
 thin-edge dev team to write new applications or new extensions of thin-edge.
@@ -20,7 +20,7 @@ There are a few other limitations like the lack of support for services on the t
 difficulty in extending existing topics with additional sub-topics, etc
 which are detailed in the requirements section.
 
-## Domain model influence
+# Domain model influence
 
 The MQTT topics and interactions are modelled around the following entities:
 
@@ -68,7 +68,52 @@ it needs to identify their source so that they can be associated with their twin
 For all the MQTT communication, this source info can be part of either the topic or the payload.
 Having them in the topics is desired, as that enables easy filtering of messages for a given device or a subset of devices.
 
-## Use-cases
+# Example deployment
+
+Here is a sample deployment structure for a smart two-wheeler that is used in the examples below:
+
+```mermaid
+graph TD;
+    TEDGE --> CENTRAL-ECU-0001;
+    CENTRAL-ECU-0001 --> ENGINE-ECU-E001;
+    CENTRAL-ECU-0001 --> WHEEL-ECU-E001;
+    CENTRAL-ECU-0001 --> WHEEL-ECU-E002;
+
+    ENGINE-ECU-E001 --> TEMP-0001((TEMP-0001));
+
+    WHEEL-ECU-E001 --> BRAKE-ECU-B001;
+    WHEEL-ECU-E001 --> TYRE-ECU-T001;
+    BRAKE-ECU-B001 --> TEMP-1001((TEMP-1001));
+    TYRE-ECU-T001 --> TEMP-1002((TEMP-1002));
+    TYRE-ECU-T001 --> PRSR-1002((PRSR-1002));
+
+    WHEEL-ECU-E002 --> BRAKE-ECU-B001'[BRAKE-ECU-B001];
+    WHEEL-ECU-E002 --> TYRE-ECU-T002;
+    BRAKE-ECU-B001' --> TEMP-1001'((TEMP-1001));
+    TYRE-ECU-T002 --> TEMP-1003((TEMP-1003));
+    TYRE-ECU-T002 --> PRSR-1003((PRSR-1003));
+
+    style BRAKE-ECU-B001 fill:#0f0
+    style BRAKE-ECU-B001' fill:#0f0
+
+    style TEMP-1001 fill:#f00
+    style TEMP-1001' fill:#f00
+```
+
+As you can see, the ECUs for the front and rear wheels have unique IDs: `WHEEL-ECU-E001` and `WHEEL-ECU-E002`,
+as they exist at the same level, connected to the central ECU(`CENTRAL-ECU-0001`).
+But, the brake ECUs connected to both the wheels could have the same ID, as they are not linked directly anyway.
+Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TEMP-0001`).
+
+So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
+
+```admonish NOTE
+Even the parent-child `id` combination for all devices is not unique in this deployment,
+as you can see that the temperature sensors on the brakes of both front wheel and rear wheel
+have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
+```
+
+# Use-cases
 
 1. Support for nested child devices.
    A deployment where a gateway device is connected to a PLC which is further connected to other sensors/devices is very common.
@@ -137,7 +182,7 @@ Having them in the topics is desired, as that enables easy filtering of messages
    You can even assume a nested chain of MQTT brokers in a hierarchical deployment,
    where each broker routes all traffic to its parent, which is further routed by that parent to its parent.
 
-## Assumptions
+# Assumptions
 
 1. All services under a given device will have unique ids, namespaced under that device id.
    But the same service name might repeat under multiple devices.
@@ -148,14 +193,14 @@ Having them in the topics is desired, as that enables easy filtering of messages
    These IDs need not be globally unique or even unique across multiple thin-edge devices.
    They just need to be unique under the tedge network that they are part of.
 
-## Requirements
+# Requirements
 
 This section is divided into 3 parts:
 1. Must-have: for the requirements that must be met by the proposed solutions
 2. Nice-to-have: these requirements are not mandatory, but the solution addressing more of these requirements would be a plus
 3. Out-of-scope: those that are relevant but out of scope for this design exercise
 
-### Must-have
+## Must-have
 
 1. All MQTT topics for main device, child device and services must start with a common prefix like `tedge/`,
    so that all tedge traffic can be filtered out easily from all other data being exchanged over the MQTT broker.
@@ -196,7 +241,7 @@ This section is divided into 3 parts:
    and thin-edge must be able to map the parent hierarchy from its unique id from then on.
 1. Easy to create static routing rules so that it is easy to map a local MQTT topic for a nested child device
 
-### Nice-to have
+## Nice-to have
 
 1. Avoid using the device id in the topics for the main tedge device to keep those well-known topics simple.
    Use aliases like `main` or `master` instead, if an identifier is really required.
@@ -214,48 +259,15 @@ This section is divided into 3 parts:
    than a simpler context agnostic scheme like `tedge/{id}` where `id` can be for any "thing".
 1. Limit the topic levels to 7 as AWS IoT core has a [max limit of 7](https://docs.aws.amazon.com/whitepapers/latest/designing-mqtt-topics-aws-iot-core/mqtt-design-best-practices.html)
 
-### Out of scope
+## Out of scope
 
 1. Routing different kinds of data to different clouds, e.g: all telemetry to azure and all commands from/to Cumulocity.
    Even though this requirement is realistic, thin-edge MQTT topics must not be corrupted with cloud specific semantics,
    and the same requirement will be handled with some external routing mechanism(e.g: routing via bridge topics)
 
-## Example deployment
+# Proposals
 
-Here is a sample deployment structure for a smart two-wheeler that is used in the examples below:
-
-```mermaid
-graph TD;
-    TEDGE --> CENTRAL-ECU-0001;
-    CENTRAL-ECU-0001 --> ENGINE-ECU-E001;
-    CENTRAL-ECU-0001 --> WHEEL-ECU-E001;
-    CENTRAL-ECU-0001 --> WHEEL-ECU-E002;
-
-    ENGINE-ECU-E001 --> TMP-0001((TMP-0001));
-
-    WHEEL-ECU-E001 --> BRAKE-ECU-A001;
-    WHEEL-ECU-E001 --> TYRE-ECU-T001;
-    BRAKE-ECU-A001 --> TMP-1001((TMP-0001));
-    TYRE-ECU-T001 --> TMP-1002((TMP-0002));
-    TYRE-ECU-T001 --> PRSR-1002((PRSR-0002));
-
-    WHEEL-ECU-E002 --> BRAKE-ECU-A001'[BRAKE-ECU-A001];
-    WHEEL-ECU-E002 --> TYRE-ECU-T002;
-    BRAKE-ECU-A001' --> TMP-1001'((TMP-0001));
-    TYRE-ECU-T002 --> TMP-1002'((TMP-0002));
-    TYRE-ECU-T002 --> PRSR-1002'((PRSR-0002));
-```
-
-As you can see, the ECUs for the front and rear wheels have unique IDs: `WHEEL-ECU-E001` and `WHEEL-ECU-E002`,
-as they exist at the same level, connected to the central ECU(`CENTRAL-ECU-0001`).
-But, the brake ECUs connected to both the wheels may have the same ID, as they are not linked directly anyway.
-Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TMP-0001`).
-
-So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
-
-## Proposals
-
-### Proposal 1: Dedicated topics for devices and services
+## Proposal 1: Dedicated topics for devices and services
 
 This proposal is built on the following assumptions/constraints:
 * thin-edge can identify the child devices (the nested ones as well), and all the services with unique IDs.
@@ -270,24 +282,40 @@ This proposal is built on the following assumptions/constraints:
 * Services need not have unique IDs across the entire hierarchy.
   They just need to have unique IDs under their parent's namespace.
 
+The proposal is as follows:
+
 Topics to have device id as the top level prefix with distinction on the target: device or service as in:
 
 ```
-tedge/<device-id>[/<target-type>]/...
+tedge/<device-id>/<target-type>/...
 ```
 
 The following demonstrates the different topic prefix for each of the target types:
 
 |Target|Topic Prefix|
 |------|-------|
-|tedge device|`tedge/main/`|
-|service on tedge device|`tedge/main/service/`|
-|child device|`tedge/<child-id>/`|
+|tedge device|`tedge/main/device/`|
+|service on tedge device|`tedge/main/service/<service-id>/`|
+|child device|`tedge/<child-id>/device/`|
 |service on child device|`tedge/<child-id>/service/<service-id>/`|
 
 Where `main` is used as an alias for the tedge device id.
 
-#### Telemetry
+**Why have the `/device/` subtopic level?**
+
+To make a clear distinction between `device` data and `service` data.
+This distinction makes it easier to subscribe to all device only data excluding the service data
+with simple subscription filters like `tedge/main/device/#`.
+Without that device suffix, something like `tedge/main/#` would include the services' data as well.
+
+
+**Why have the `/service/` subtopic level and not have the <service-id> directly?**
+
+Primarily for future-proofing as `service` is a new kind of child abstraction that we've added now.
+If another abstraction is introduced in the future, say `plugin`, they can be namespaced under a `plugin/` subtopic.
+It also makes the distinction from `device` data clearer.
+
+### Telemetry
 
 For telemetry data, the topics would be grouped under a `telemetry/` sub-topic as follows:
 
@@ -326,17 +354,14 @@ tedge/<device-id>/+/#
 
 Creating ACL rules is also simplified by allowing telemetry data to be controlled independently to the command topics.
 
-**Why have the `/service` subtopic level and not have the <service-id> directly?**
-
-Primarily for future-proofing as `service` is a new kind of child abstraction that we've added now.
-If another abstraction comes in the future, say `plugin`, they can be namespaced under a `plugin/` subtopic.
-
-#### Commands
+### Commands
 
 Similarly, all commands would be grouped under a `commands/` sub-topic as follows:
 
-For requests: `tedge/<device-id>/<target-type>/commands/req/<operation-type>/<operation-specific-keys>...`
-For responses: `tedge/<device-id>/<target-type>/commands/res/<operation-type>/<operation-specific-keys>...`
+|Target|Topic structure|
+|------|-------|
+|For requests|`tedge/<device-id>/<target-type>/commands/req/<operation-type>/<operation-specific-keys>...`|
+|For responses|`tedge/<device-id>/<target-type>/commands/res/<operation-type>/<operation-specific-keys>...`|
 
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
@@ -393,7 +418,7 @@ tedge/<child-id>/commands/res/software_update
 ```
 
 
-If command support is added to servcies in future, they'd follow a similar pattern as in:
+If command support is added to services in future, they'd follow a similar pattern as in:
 
 ```
 tedge/<device-id>/service/<service-id>/commands/req/software_list
@@ -404,7 +429,7 @@ Although all the above examples maintain consistent structure by ending with the
 further additions are possible in future if desired for a given operation type.
 For e.g: `tedge/main/commands/req/config_update/<config-type>` to address a specific `config-type`
 
-#### Registration service for child devices
+### Registration service for child devices
 
 Immediate and nested child devices can be registered with thin-edge using its registration service,
 by sending the following MQTT message to the topic: `tedge/main/register/req/child`:
@@ -457,7 +482,7 @@ to send telemetry data or receive commands as follows:
 |Measurement|`tedge/descendent/<internal-id>/telemetry/measurements`|
 |Command|`tedge/descendent/<internal-id>/commands/req/software_list`|
 
-#### Automatic registration
+### Automatic registration
 
 Automatic registration is supported for services as they are expected to have unique names under each device namespace,
 and they do not supporting nesting, eliminating any name clashes that way. 
