@@ -79,7 +79,7 @@ graph TD;
     CENTRAL-ECU-0001 --> WHEEL-ECU-E001;
     CENTRAL-ECU-0001 --> WHEEL-ECU-E002;
 
-    ENGINE-ECU-E001 --> TEMP-0001((TEMP-1001));
+    ENGINE-ECU-E001 --> TEMP-1001*((TEMP-1001));
 
     WHEEL-ECU-E001 --> BRAKE-ECU-B001;
     WHEEL-ECU-E001 --> TYRE-ECU-T001;
@@ -96,15 +96,15 @@ graph TD;
     style BRAKE-ECU-B001 fill:#0f0
     style BRAKE-ECU-B001' fill:#0f0
 
-    style TEMP-0001 fill:#fa0
-    style TEMP-1001 fill:#f00
-    style TEMP-1001' fill:#f00
+    style TEMP-1001* fill:#fa0
+    style TEMP-1001 fill:#fa0
+    style TEMP-1001' fill:#fa0
 ```
 
 As you can see, the ECUs for the front and rear wheels have unique IDs: `WHEEL-ECU-E001` and `WHEEL-ECU-E002`,
 as they exist at the same level, connected to the central ECU(`CENTRAL-ECU-0001`).
 But, the brake ECUs connected to both the wheels could have the same ID, as they are not linked directly anyway.
-Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TEMP-10001`).
+Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TEMP-1001`).
 
 So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
 
