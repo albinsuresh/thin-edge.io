@@ -182,6 +182,7 @@ have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
    Especially, if tedge is running on those child devices as well, this must be feasible.
    You can even assume a nested chain of MQTT brokers in a hierarchical deployment,
    where each broker routes all traffic to its parent, which is further routed by that parent to its parent.
+1. **Use-case for swapping child devices**
 
 # Assumptions
 
@@ -531,6 +532,7 @@ Examples:
 |immediate child device|`tedge/main/<child-id>/device/`|
 |descendent child device|`tedge/<parent-child-id>/<child-id>/`|
 |service on child device|`tedge/<child-id>/service/<service-id>/`|
+|service on descendent child device|`tedge/<parent-child-id>/<child-id>/service/<service-id>/`|
 
 For the main device, there is no change as it is the root device,
 unless we want to make it more explicit and symmetric with a `root` prefix like `tedge/root/main/device/`
@@ -612,35 +614,37 @@ Examples:
 
 Here is a comparison of both proposals against all the key requirements:
 
-| Requirements | Proposal 1: Context in topics | Proposal 2: ID only topics |
-| --- | --- | ---|
-| **_Must-Haves_** |
-| Support nested child devices | Yes | Yes |
-| Support services | Yes | Yes |
-| Dynamic registration for child devices | Yes | Yes |
-| Dynamic registration for services | Yes | No |
-| Dynamic registration for nested child devices | No | No |
-| Limit data access to a given entity | Yes | Yes |
-| Supports extension for new entities | Yes| Yes|
-| Supports extension for new data specific types | Yes| Yes|
-| Support local-only data exchange | Introduce new topic level under `tedge/` | Use a namespace other than `tedge/` |
-| Least message size | No | Yes |
-| _Filtering capabilities_ |
-| * All data from everything | `tedge/#` | `tedge/#` |
-| * All thin-edge device data excluding everything else | `tedge/main/device/#` | `tedge/main/#` |
-| * All thin-edge device and services data excluding child devices | `tedge/main/+/#` | `tedge/main/#` + List of `tedge/<service-id>/#` |
-| * A specific service data | `tedge/<device-id>/service/<service-id>/#` | `tedge/<service-id>/#` |
-| * A specific child device data including services | `tedge/<child-id>/+/#` | List of `tedge/<entity-id>/#`
-| * A specific child device data excluding services | `tedge/<child-id>/device/#` | `tedge/device/#`
-| * All data from all child devices | `tedge/<child-id>/device/#` | List of `tedge/<child-id>/#` |
-| * All child devices data excluding main | List of `tedge/<child-id>/device/#` | List of `tedge/<child-id>/#` |
-| * All data from a given child device and its descendants | List of `tedge/<child-id>/+/#` | List of `tedge/<child-id>/#` + List of `tedge/<service-id>/#` on those devices |
-| **_Good-to-Have_** |
-| Source context in message | Yes | No |
-| Within the topic limit of AWS | Barely | Easily |
+`"` means the same as the previous proposal.
 
-```admonish NOTE
-Whenever a list of entities is required for a topic filter, it involves a lookup in the inventory for their IDs.
-For something like a given parent's child devices **and** their services, multiple lookups are required
-to get the list of services for each child devices. 
-```
+
+| Requirements | Proposal 1: Context in topics | Extended proposal 1 | Proposal 2: ID only topics |
+| --- | --- | --- | --- |
+| **_Must-Haves_** |
+| Support nested child devices | Yes | Yes | Yes |
+| Support services | Yes | Yes | Yes |
+| Dynamic registration for child devices | Yes | Yes | Yes |
+| Dynamic registration for services | Yes | Yes | No |
+| Dynamic registration for nested child devices | No | Yes | No |
+| Limit data access to a given entity | Yes | Yes | Yes |
+| Supports extension for new entities | Yes | Yes | Yes|
+| Supports extension for new data specific types | Yes | Yes | Yes|
+| Support local-only data exchange | Introduce new topic level under `tedge/` | " [^1] | Use a namespace other than `tedge/` |
+| Message size | High | Highest | Least |
+| --- | --- | --- | --- |
+| _Filtering capabilities_ |
+| * All data from everything | `tedge/#` | `tedge/#`  | `tedge/#` |
+| * All thin-edge device data excluding everything else | `tedge/main/device/#` | " | `tedge/main/#` |
+| * All thin-edge device and services data excluding child devices | `tedge/main/+/#` | " | `tedge/main/#` + List of `tedge/<service-id>/#` [^1] |
+| * A specific service data | `tedge/<device-id>/service/<service-id>/#` | " | `tedge/<service-id>/#` |
+| * A specific child device data including services | `tedge/<child-id>/+/#` | `tedge/<parent-id>/<child-id>/+/#` | `tedge/<child-id>/#` + List of `tedge/<service-id>/#`
+| * A specific child device data excluding services | `tedge/<child-id>/device/#` | `tedge/<parent-id>/<child-id>/device/+/#` | `tedge/<child-id>/#`
+| * All data from a given child device and its descendants | List of `tedge/<child-id>/+/#` | List of `tedge/<parent-id>/<child-id>/+/+/#` | List of `tedge/<child-id>/#` + List of `tedge/<service-id>/#` on those devices |
+| * All data from all immediate child devices of a parent | List of `tedge/<child-id>/+/#` | `tedge/<parent-child-id>/+/+/#` | List of `tedge/<child-id>/#` + List of `tedge/<service-id>/#` on those devices [^2] |
+| * Data from all child devices excluding main | List of `tedge/<child-id>/device/#` | List of `tedge/<parent-id>/<child-id>/device/+/#` | List of `tedge/<child-id>/#` |
+| --- | --- | --- | --- |
+| **_Good-to-Have_** |
+| Source context in message | Yes | Yes | No |
+| Within the topic limit of AWS | Barely | Exceeds | Easily |
+
+[^1] The list implies a lookup into the inventory of the main device to find all its services and create the filter with the list of those IDs
+[^2] First find the list of all children of the given parent and then find the list of services on all of them
