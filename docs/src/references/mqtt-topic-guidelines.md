@@ -79,7 +79,7 @@ graph TD;
     CENTRAL-ECU-0001 --> WHEEL-ECU-E001;
     CENTRAL-ECU-0001 --> WHEEL-ECU-E002;
 
-    ENGINE-ECU-E001 --> TEMP-0001((TEMP-0001));
+    ENGINE-ECU-E001 --> TEMP-0001((TEMP-1001));
 
     WHEEL-ECU-E001 --> BRAKE-ECU-B001;
     WHEEL-ECU-E001 --> TYRE-ECU-T001;
@@ -96,6 +96,7 @@ graph TD;
     style BRAKE-ECU-B001 fill:#0f0
     style BRAKE-ECU-B001' fill:#0f0
 
+    style TEMP-0001 fill:#fa0
     style TEMP-1001 fill:#f00
     style TEMP-1001' fill:#f00
 ```
@@ -103,7 +104,7 @@ graph TD;
 As you can see, the ECUs for the front and rear wheels have unique IDs: `WHEEL-ECU-E001` and `WHEEL-ECU-E002`,
 as they exist at the same level, connected to the central ECU(`CENTRAL-ECU-0001`).
 But, the brake ECUs connected to both the wheels could have the same ID, as they are not linked directly anyway.
-Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TEMP-0001`).
+Even the sensors attached at many levels in such a complex deployment may have the same IDs(`TEMP-10001`).
 
 So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
 
@@ -148,8 +149,8 @@ have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
    (e.g: `tedge-agent-abcaa88d-8e4f-4272-84fc-fead2a8890b0`) or something like that,
    it would be better to avoid this, as they are really not very user friendly.
    Hence, service ids must be namespaced under each device that it is running on.
-1. **TO BE CONFIRMED** Child device ids also must be namespaced under their direct parent
-   so that conflicts can be avoided even if another parent device has child devices with the same id.
+1. Child device ids also must be namespaced under their direct parent
+   so that conflicts can be avoided even if another parent device has a child device with the same id.
    It is okay to expect all devices connected to a device to have unique ids,
    but expecting those to be unique across an entire fleet could be far-fetched.
 1. If all child devices in a fleet can not guarantee uniqueness in their IDs,
@@ -606,3 +607,40 @@ Examples:
   without worrying about device IDs and their context (whether deployed on main or child device).
   The `tedge/self` prefix must be mapped to `tedge/main` on the main device and `tedge/<child-id>` on the child devices.
   The "connection mechanism" (e.g `tedge connect` on main) can define this as a static mqtt routing rule on each device.
+
+## Comparison
+
+Here is a comparison of both proposals against all the key requirements:
+
+| Requirements | Proposal 1: Context in topics | Proposal 2: ID only topics |
+| --- | --- | ---|
+| **_Must-Haves_** |
+| Support nested child devices | Yes | Yes |
+| Support services | Yes | Yes |
+| Dynamic registration for child devices | Yes | Yes |
+| Dynamic registration for services | Yes | No |
+| Dynamic registration for nested child devices | No | No |
+| Limit data access to a given entity | Yes | Yes |
+| Supports extension for new entities | Yes| Yes|
+| Supports extension for new data specific types | Yes| Yes|
+| Support local-only data exchange | Introduce new topic level under `tedge/` | Use a namespace other than `tedge/` |
+| Least message size | No | Yes |
+| _Filtering capabilities_ |
+| * All data from everything | `tedge/#` | `tedge/#` |
+| * All thin-edge device data excluding everything else | `tedge/main/device/#` | `tedge/main/#` |
+| * All thin-edge device and services data excluding child devices | `tedge/main/+/#` | `tedge/main/#` + List of `tedge/<service-id>/#` |
+| * A specific service data | `tedge/<device-id>/service/<service-id>/#` | `tedge/<service-id>/#` |
+| * A specific child device data including services | `tedge/<child-id>/+/#` | List of `tedge/<entity-id>/#`
+| * A specific child device data excluding services | `tedge/<child-id>/device/#` | `tedge/device/#`
+| * All data from all child devices | `tedge/<child-id>/device/#` | List of `tedge/<child-id>/#` |
+| * All child devices data excluding main | List of `tedge/<child-id>/device/#` | List of `tedge/<child-id>/#` |
+| * All data from a given child device and its descendants | List of `tedge/<child-id>/+/#` | List of `tedge/<child-id>/#` + List of `tedge/<service-id>/#` on those devices |
+| **_Good-to-Have_** |
+| Source context in message | Yes | No |
+| Within the topic limit of AWS | Barely | Easily |
+
+```admonish NOTE
+Whenever a list of entities is required for a topic filter, it involves a lookup in the inventory for their IDs.
+For something like a given parent's child devices **and** their services, multiple lookups are required
+to get the list of services for each child devices. 
+```
