@@ -182,7 +182,7 @@ have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
    Especially, if tedge is running on those child devices as well, this must be feasible.
    You can even assume a nested chain of MQTT brokers in a hierarchical deployment,
    where each broker routes all traffic to its parent, which is further routed by that parent to its parent.
-1. **Use-case for swapping child devices**
+1. **TODO**: Use-case for swapping child devices in a live deployment
 
 # Assumptions
 
@@ -323,9 +323,12 @@ For telemetry data, the topics would be grouped under a `telemetry/` sub-topic a
 
 |Type|Example|
 |------|-------|
-|Measurements|`<target_prefix>/telemetry/measurements`|
+|Measurements|`<target_prefix>/telemetry/measurements/[/<measurement-type>]`|
 |Events|`<target_prefix>/telemetry/events/<event-type>`|
-|Alarms|`<target_prefix>/telemetry/alarms/<alarm-type>/<severity>`|
+|Alarms|`<target_prefix>/telemetry/alarms/<alarm-type>`|
+
+The `measurement-type` is optional for `measurements`.
+The alarm `severity` which was earlier part the topic have been moved to the payload.
 
 **Examples**
 
@@ -367,31 +370,16 @@ Similarly, all commands would be grouped under a `commands/` sub-topic as follow
 
 The `operation-specific-keys` are optional and the number of such keys (topic levels) could vary from one operation to another.
 
-Child devices follow a similar structure for commands as well:
-
-```
-tedge/<child-id>/commands/req/software_list
-tedge/<child-id>/commands/res/software_update
-```
-
-
-If command support is added to services in future, they'd follow a similar pattern as in:
-
-```
-tedge/<device-id>/service/<service-id>/commands/req/software_list
-tedge/<device-id>/service/<service-id>/commands/req/software_list
-```
-
 **Examples:**
 
-* Software list operation
+* Software list operation on main device
 
    ```
    tedge/main/device/commands/req/software_list
    tedge/main/device/commands/res/software_list
    ```
 
-* Software update operation
+* Software update operation on child device
 
    ```
    tedge/<child-id>/device/commands/req/software_update
@@ -412,14 +400,14 @@ tedge/<device-id>/service/<service-id>/commands/req/software_list
    tedge/main/device/commands/res/device_restart
    ```
 
-* Configuration snapshot operation
+* Configuration snapshot operation on a main device service
 
    ```
    tedge/main/service/<service-id>/commands/req/config_snapshot
    tedge/main/service/<service-id>/commands/res/config_snapshot
    ```
 
-* Configuration update operation
+* Configuration update operation on a child device service
 
    ```
    tedge/<child-id>/service/<service-id>/commands/req/config_update
@@ -474,14 +462,16 @@ The `<generated-id>` will use the `<desired-child-id-prefix>` sent in the regist
 
 A failure is indicated with a failed status: `{ "status": "failed" }`.
 
-Once the registration is complete, these nested child devices can use the `tedge/<generated-id>` topic prefix
+Once the registration is complete, these nested child devices should use the `tedge/<generated-id>` topic prefix
 to send telemetry data or receive commands as follows:
 
 
 |Type|Topic structure|
 |----|---------------|
-|Measurement|`tedge/descendent/<internal-id>/telemetry/measurements`|
-|Command|`tedge/descendent/<internal-id>/commands/req/software_list`|
+|Measurement (device)|`tedge/<internal-id>/device/telemetry/measurements`|
+|Command (device)|`tedge/<internal-id>/device/commands/req/software_list`|
+|Measurement (service)|`tedge/<internal-id>/service/<service-id>/telemetry/measurements`|
+|Command (service)|`tedge/<internal-id>/service/<service-id>/commands/req/config_snapshot`|
 
 ### Automatic registration
 
