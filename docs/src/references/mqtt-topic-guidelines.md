@@ -45,8 +45,6 @@ The MQTT topics and interactions are modelled around the following entities:
    For example, a device can have a cloud connector/agent software that can be viewed as a service.
    Any software on the device can be modelled as a service, if monitoring them separately from the device makes sense.
    This abstraction be also be used to isolate various aspects of the device itself into separate groups, but still linked to the device.
-   For example, if you model a car as a device, the sensor data coming from different tyres, breaks, engine, infotainment system etc
-   can be isolated into their own respective services (more like light-weight child devices).
 
    A service can have its own telemetry data which is separate from the device's telemetry data.
    For e.g: a service running on a device can report its own RAM or disk usage,
@@ -144,7 +142,7 @@ have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
    * All messages from a subset of child devices based on some filtering criteria (e.g: device-type, firmware version etc)
 1. Since services are typically software components, and the same component would be running on multiple devices,
    the names/ids of these components could be the same on all devices.
-   Unlike device ids, we can't expect the service names to be unique across a large fleet of devices either.
+   We can't expect the service names to be unique across a large fleet of devices either.
    Although we can force the service developers to keep them unique with UUID **suffixes**
    (e.g: `tedge-agent-abcaa88d-8e4f-4272-84fc-fead2a8890b0`) or something like that,
    it would be better to avoid this, as they are really not very user friendly.
