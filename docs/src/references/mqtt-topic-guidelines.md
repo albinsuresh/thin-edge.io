@@ -612,19 +612,7 @@ But there are conventions that can be followed to cover a wide range of use-case
 * `te/<device-namespace>/<device-id>/<service-namespace>/<service-id>/...`
 * `te/<device-namespace>/<device-id>/<device-local-namespace>/<device-local-component-id>/...`
 * `te/<entity-namespace>/<entity-id>/<component-namespace>/<component-id>/...`
-
-If your use-case doesn't need so many levels to identify an entity,
-the unnecessary levels can be skipped with the `_` (underscore) character as follows:
-
-```
-te/<entity-id>/_/_/_/...
-```
-
-or 
-
-```
-te/_/_/_/<entity-id>/...
-```
+* `te/<device-family>/<device-series>/<part-series>/<part-id>/...`
 
 Even for the data type levels, a user is free to define those as they wish.
 But thin-edge has some pre-defined `<data-type>` subtopics for well-known types like:
@@ -655,12 +643,12 @@ But thin-edge has some pre-defined `<data-type>` subtopics for well-known types 
 
 Since thin-edge doesn't enforce what each device identification level means,
 an explicit registration is required to register every entity that is going to send data or receive commands.
-For example, before a measurement can be sent from a service named `collectd` from the device `Rpi1001`,
-the entity named `Rpi1001` must be registered as a `device`, and `collectd` must be registered as a `service`.
+For example, before a measurement can be sent from a service named `tedge-agent` from the device `Rpi1001`,
+the entity named `Rpi1001` must be registered as a `device`, and `tedge-agent` must be registered as a `service`.
 
 An entity can be registered with thin-edge by publishing a retained message to the entity identification topic prefix
 with the entity type and other metadata that defines that entity.
-To model the example mentioned above, an entity identification topic scheme like the following can be used:
+To model the example mentioned above, if an entity identification topic scheme like the following is used:
 
 ```
 te/<device-namespace>/<device-id>/<service-namespace>/<service-id>
@@ -669,7 +657,7 @@ te/<device-namespace>/<device-id>/<service-namespace>/<service-id>
 The `Rpi1001` device must be registered as a `device` by publishing the following retained message:
 
 ```sh te2mqtt
-tedge mqtt pub -r tedge/_/Rpi1001 '{
+tedge mqtt pub -r te/_/Rpi1001 '{
   "type": "device"
 }'
 ```
@@ -678,10 +666,10 @@ The device is registered under the default namespace indicated by `_` at the sec
 The registration message supports additional fields like `name`, `parent`, `device-type` etc as well,
 which will be explained in detail later.
 
-Once the device is registered, the `collectd` service can be registered as a `service` type as follows:
+Once the device is registered, the `tedge-agent` service can be registered as a `service` type as follows:
 
 ```sh te2mqtt
-tedge mqtt pub -r tedge/_/Rpi1001/_/collectd '{
+tedge mqtt pub -r te/_/Rpi1001/_/tedge-agent '{
   "type": "service"
 }'
 ```
@@ -689,8 +677,48 @@ tedge mqtt pub -r tedge/_/Rpi1001/_/collectd '{
 Once these entities are registered, they can start sending data or receive commands.
 
 Examples:
-* Device measurement: `tedge/_/Rpi1001/_/_/mes/battery_reading`
-* Service measurement: `tedge/_/Rpi1001/_/collectd/mes/cpu_usage`
+
+* Device measurement:
+
+   ```sh te2mqtt
+   tedge mqtt pub -r te/_/Rpi1001/_/_/mes/battery_reading` '{
+      "charge": 88
+      "temperature": 32,
+      "voltage": 45,
+      "current": 15
+   }'
+   ```
+
+* Service measurement
+
+   ```sh te2mqtt
+   tedge mqtt pub -r te/_/Rpi1001/_/tedge-agent/mes/cpu_usage` '{
+      "usage": 23
+      "threads": 36,
+      "up_time": 3726,
+   }'
+   ```
+
+If the the user had used a different entity identification scheme like
+`te/<device-family>/<device-series>/<part-series>/<part-id>/...` instead,
+where the `<part-id>` is the unique device identifier,
+the registration message should have to be sent to the ``te/<device-family>/<device-series>/<part-series>/<part-id>` topic,
+with the `type` as `device`.
+
+So, it is completely up-to the user to choose how many levels he wants to uniquely identify devices and services.
+
+If your use-case doesn't need so many levels to identify an entity,
+the unnecessary levels can be skipped with the `_` (underscore) character as follows:
+
+```
+te/<entity-id>/_/_/_/...
+```
+
+or 
+
+```
+te/_/_/_/<entity-id>/...
+```
 
 **Main Device**
 
@@ -698,11 +726,11 @@ The main device does not need any explicit registration and can be referred to u
 Hence, a measurement associated to the main device can be sent to following topic:
 
 ```
-`tedge/_/main/_/_/mes/battery_reading`
+te/_/main/_/_/mes/battery_reading
 ```
 
 But if some additional metadata needs to be added to the main device,
-they can be pushed to the `tedge/_/main` topic as done using a registration message.
+they can be pushed to the `te/_/main` topic as done using a registration message.
 
 **Immediate Child Devices**
 
@@ -727,10 +755,11 @@ and auto-register the entities as per their positions in the topics.
 For example, if the following measurement message is received without any explicit registrations,
 
 ```
-tedge/device_namespace/Rpi1001/service_namespace/collectd/mes/cpu_usage
+te/abc_device_namespace/Rpi1001/xyz_service_namespace/collectd/mes/cpu_usage
 ```
 
-`Rpi1001` and `collectd` will be auto-registered as `device` and `service` types respectively.
+`Rpi1001` and `collectd` will be auto-registered as `device` and `service` types,
+with their `device type` and `service type` derived from their respective namespaces.
 
 ### Data type metadata
 
@@ -740,7 +769,7 @@ For example, the units associated with measurements in the `battery_reading` mea
 can be updated by publishing the following message:
 
 ```sh te2mqtt
-tedge mqtt pub -r tedge/_/Rpi1001/_/collectd/mes/battery_reading/meta '{
+tedge mqtt pub -r te/_/Rpi1001/_/_/mes/battery_reading/meta '{
   "units": {
     "temperature": "C",
     "voltage": "V",
