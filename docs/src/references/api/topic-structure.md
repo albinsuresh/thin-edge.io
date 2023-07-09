@@ -392,7 +392,7 @@ tedge mqtt pub 'te/device/main/service/nodered/e/flow_status' '{"text":"Low flow
 
 </details>
 
-<details open>
+<details>
 <summary>Service of a child device</summary>
 
 ```sh te2mqtt
