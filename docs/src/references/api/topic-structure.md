@@ -37,7 +37,7 @@ tedge mqtt pub -r 'te/child/child01///m/environment' '{
 ### Publish to a service on the main device
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/device/main/service/myservice/m/environment' '{
+tedge mqtt pub -r 'te/device/main/service/nodered/m/environment' '{
   "temperature": 23.4
 }'
 ```
@@ -58,6 +58,14 @@ Or to subscribe to a specific type of measurement published to an services on th
 
 ```sh te2mqtt
 tedge mqtt sub 'te/device/main/service/+/m/memory'
+```
+
+### Publish to a service on a child device
+
+```sh te2mqtt
+tedge mqtt pub -r 'te/device/child01/service/nodered/m/environment' '{
+  "temperature": 23.4
+}'
 ```
 
 ### Check which entities have been registered
@@ -144,7 +152,7 @@ tedge mqtt pub -r 'te/flowserve/abcdef01234///m/flow_rate_average' '{
 ### Advantages
 
 * Get the entity/component list out of the box
-  * User just has to publish retain messages, e.g. publish to `te/device/main` or `te/device/main/service/tedge-agent`
+  * User just has to publish retain messages, e.g. publish to `te/device/main` or `te/device/main/service/nodered`
 
 * Normalized topic structure. This makes it easier for other components to observe the data
 
@@ -233,13 +241,13 @@ The function about can be used to verify the topic to name transformation, using
 assert get_external_id("te/device/main///m/environment") == "tedge_001:device:main"
 
 # Service on main device
-assert get_external_id("te/device/main/service/tedge-agent/m/environment") == "tedge_001:device:main:service:tedge-agent"
+assert get_external_id("te/device/main/service/nodered/m/environment") == "tedge_001:device:main:service:nodered"
 
 # Child device
 assert get_external_id("te/child/child01///m/environment") == "tedge_001:child:child01"
 
 # Service on child device
-assert get_external_id("te/child/child01/service/tedge-agent/m/environment") == "tedge_001:child:child01:service:tedge-agent"
+assert get_external_id("te/child/child01/service/nodered/m/environment") == "tedge_001:child:child01:service:nodered"
 ```
 
 ### Measurements
@@ -270,13 +278,13 @@ tedge mqtt pub 'te/device/main///m/environment' '{"temperature":23.4}'
 #### Service of a main device
 
 ```sh te2mqtt
-tedge mqtt pub 'te/device/main/service/tedge-agent/m/environment' '{"temperature":23.4}'
+tedge mqtt pub 'te/device/main/service/nodered/m/environment' '{"temperature":23.4}'
 ```
 
 ```json title="Output Topic: c8y/measurement/measurements/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main:service:tedge-agent",
+    "externalId": "tedge_001:device:main:service:nodered",
     "type": "c8y_Serial"
   },
   "temperature": {
@@ -313,13 +321,13 @@ tedge mqtt pub 'te/device/main///e/flow_status' '{"text":"Low flow detected"}'
 #### Service of a main device
 
 ```sh te2mqtt
-tedge mqtt pub 'te/device/main/service/tedge-agent/e/flow_status' '{"text":"Low flow detected"}'
+tedge mqtt pub 'te/device/main/service/nodered/e/flow_status' '{"text":"Low flow detected"}'
 ```
 
 ```json title="Output Topic: c8y/event/events/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main:service:tedge-agent",
+    "externalId": "tedge_001:device:main:service:nodered",
     "type": "c8y_Serial"
   },
   "text": "Low flow detected",
@@ -352,13 +360,13 @@ tedge mqtt pub 'te/device/main///a/disk_usage' '{"text":"Disk space is low"}'
 #### Service of a main device
 
 ```sh te2mqtt
-tedge mqtt pub 'te/device/main/service/tedge-agent/a/health' '{"text":"Service is stopped"}'
+tedge mqtt pub 'te/device/main/service/nodered/a/health' '{"text":"Service is stopped"}'
 ```
 
 ```json title="Output Topic: c8y/alarm/alarms/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main:service:tedge-agent",
+    "externalId": "tedge_001:device:main:service:nodered",
     "type": "c8y_Serial"
   },
   "severity": "CRITICAL",
@@ -578,12 +586,24 @@ tedge mqtt pub 'c8y/devicecontrol/notifications' '{
   * `te:device:nested_child01`
 
   ```json
-  "te/device/nested_child01/service/tedge-agent": {
+  "te/device/nested_child01/service/nodered": {
     "@type": "service",
     "@parent": "te/device/nested_child01",
-    "displayName": "tedge-agent",
+    "displayName": "nodered",
     "type": "systemd"
   }
   ```
 
 6. Device registration: Should users be allows to register a component under `te/my/component`, a topic which is normally reserved for devices?
+
+7. How to register supported operations
+
+    ```sh te2mqtt
+    tedge mqtt pub 'te/tedge/main///cmd/software_update/meta' '{}'
+    ```
+
+    Other clients can subscribe to the following topic to check which operations are supported by each entity/component.
+
+    ```sh te2mqtt
+    tedge mqtt sub 'te/+/+/+/+/cmd/+/meta' '{}'
+    ```

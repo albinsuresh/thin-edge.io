@@ -159,10 +159,10 @@ tedge mqtt pub -r 'te/device/nested_child01' '{
 ### Example: Register a service of the main device
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/device/main/service/tedge-agent' '{
+tedge mqtt pub -r 'te/device/main/service/nodered' '{
   "@type": "service",
   "@parent": "te/device/main",
-  "displayName": "tedge-agent",
+  "displayName": "nodered",
   "type": "systemd"
 }'
 ```
@@ -170,10 +170,10 @@ tedge mqtt pub -r 'te/device/main/service/tedge-agent' '{
 ### Example: Register a service of a child device
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/device/child01/service/tedge-agent' '{
+tedge mqtt pub -r 'te/device/child01/service/nodered' '{
   "@type": "service",
   "@parent": "te/device/child01",
-  "displayName": "tedge-agent",
+  "displayName": "nodered",
   "type": "systemd"
 }'
 ```
@@ -181,10 +181,10 @@ tedge mqtt pub -r 'te/device/child01/service/tedge-agent' '{
 ### Example: Register a service of a nested child device
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/device/nested_child01/service/tedge-agent' '{
+tedge mqtt pub -r 'te/device/nested_child01/service/nodered' '{
   "@type": "service",
   "@parent": "te/device/nested_child01",
-  "displayName": "tedge-agent",
+  "displayName": "nodered",
   "type": "systemd"
 }'
 ```

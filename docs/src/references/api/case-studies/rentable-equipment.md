@@ -245,10 +245,10 @@ mosquitto_sub -t 'te/+/+' -t 'te/+/+/+/+' -F '{"%t":%p}' -W 1 | jq -s 'add'
     "displayName": "nodered",
     "type": "systemd"
   },
-  "te/device/nested_child01/service/tedge-agent": {
+  "te/device/nested_child01/service/nodered": {
     "@type": "service",
     "@parent": "te/device/nested_child01",
-    "displayName": "tedge-agent",
+    "displayName": "nodered",
     "type": "systemd"
   },
   "te/device/main/service/nodered": {
