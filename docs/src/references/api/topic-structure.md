@@ -8,7 +8,7 @@ sidebar_position: 1
 
 The following examples will demonstrate how the flexible topic structure can be used to provide rich modelling tools to publish data which is more observable to other components.
 
-## Example: Using fixed topic names for the target entity
+## Example: Default device/service topic semantics
 
 ### Publish to the main device
 
@@ -92,10 +92,10 @@ Check out the [Case Studies](./case-studies) page for more detailed examples in 
 
 Since the topic structure is flexible, it means that you can use it to represent anything you would like.
 
-For instance, if you could use the topic names to represent the information about the equipment to ensure it uniqness within the thin-edge.io root topic (`te/`) by using the manufacturer, device serial number (or model number), optional application name and aplication instance.
+For instance, if you could use the topic names to represent the information about the equipment to ensure it is unique within the thin-edge.io root topic (`te/`) by using the manufacturer, device serial number (or model number), optional application name and application instance.
 
 ```text
-te/{family}/{serial}/{application}/{application_instance}/{channel}
+te/{family}/{serial}/{application}/{instance}/{channel}
 ```
 
 
@@ -108,7 +108,7 @@ tedge mqtt pub -r 'te/flowserve/abcdef01234///e/pump_status' '{
 However for specific telemetry data you might want to be more specific.
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/flowserve/abcdef01234///e/pump_status' '{
+tedge mqtt pub -r 'te/flowserve/abcdef01234/pumps/monitoring/e/pump_status' '{
   "text": "Pump is running"
 }'
 ```
@@ -118,12 +118,6 @@ tedge mqtt pub -r 'te/flowserve/abcdef01234///e/pump_status' '{
 Let's say you wanted to use an analytics engine to listen to specific measurements which should not be sent to the cloud as the analytics application will transform the raw values to an average which will then be published to the cloud.
 
 ACL rules can be used to control which telemetry data is received by the analytics engine.
-
-```sh te2mqtt
-tedge mqtt pub -r 'te/flowserve/abcdef01234/analytics/average/m/flow_rate' '{
-  "flow_rate": 0.01
-}'
-```
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/flowserve/abcdef01234/analytics/average/m/flow_rate' '{
@@ -146,29 +140,6 @@ tedge mqtt pub -r 'te/flowserve/abcdef01234///m/flow_rate_average' '{
   "flow_rate": 0.015
 }'
 ```
-
-## Summary
-
-### Advantages
-
-* Get the entity/component list out of the box
-  * User just has to publish retain messages, e.g. publish to `te/device/main` or `te/device/main/service/nodered`
-
-* Normalized topic structure. This makes it easier for other components to observe the data
-
-* Ability to decouple topic hierarchy from entity hierarchy
-  * Multiple devices could publish to the same cloud entity (if you wanted), yet keeping the data separate on the local MQTT broker
-
-* Ability to mix and match topics using local bridge (e.g. chaining local MQTT brokers)
-
-* Enable users to generate unique namespaces
-
-* Also allows for entity/component inference when using configurable (magic) namespace names which will map a namespace to an entity type
-
-
-### Disadvantages
-
-* Longer topic structure
 
 ## Message Transformations
 
@@ -201,13 +172,13 @@ The above topic can be converted to an external identity using the following ste
     ["te", "device", "main", "", ""]
     ```
 
-3. Replace the first item with the device certificate's common name (e.g. `te` &rarr; `tedge_001`)
+3. Remove any array items with an empty strings
 
     ```json title="New result"
-    ["tedge_001", "device", "main", "", ""]
+    ["te", "device", "main"]
     ```
 
-4. Remove any array items with an empty strings
+4. Replace the first item with the device certificate's common name (e.g. `te` &rarr; `tedge_001`)
 
     ```json title="New result"
     ["tedge_001", "device", "main"]
@@ -218,6 +189,10 @@ The above topic can be converted to an external identity using the following ste
     ```text title="New result"
     tedge_001:device:main
     ```
+
+6. Shorten specific identities (if necessary)
+
+    There is a special case where the identity of `tedge_001:device:main` is shorted to just `tedge_001`, as this is done so that it matches the Common Name included in the certificate.
 
 #### Example: Converting topic to external id using python
 
@@ -238,7 +213,7 @@ The function about can be used to verify the topic to name transformation, using
 
 ```py
 # Main device
-assert get_external_id("te/device/main///m/environment") == "tedge_001:device:main"
+assert get_external_id("te/device/main///m/environment") == "tedge_001"
 
 # Service on main device
 assert get_external_id("te/device/main/service/nodered/m/environment") == "tedge_001:device:main:service:nodered"
@@ -261,7 +236,7 @@ tedge mqtt pub 'te/device/main///m/environment' '{"temperature":23.4}'
 ```json title="Output Topic: c8y/measurement/measurements/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main",
+    "externalId": "tedge_001",
     "type": "c8y_Serial"
   },
   "temperature": {
@@ -275,7 +250,36 @@ tedge mqtt pub 'te/device/main///m/environment' '{"temperature":23.4}'
 }
 ```
 
-#### Service of a main device
+
+<details>
+<summary>Child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01///m/environment' '{"temperature":23.4}'
+```
+
+```json title="Output Topic: c8y/measurement/measurements/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01",
+    "type": "c8y_Serial"
+  },
+  "temperature": {
+    "temperature": {
+      "unit": "",
+      "value": 23.4
+    }
+  },
+  "time": "2023-07-07T13:52:40.927797+02:00",
+  "type": "environment"
+}
+```
+
+</details>
+
+
+<details>
+<summary>Service of a main device</summary>
 
 ```sh te2mqtt
 tedge mqtt pub 'te/device/main/service/nodered/m/environment' '{"temperature":23.4}'
@@ -298,6 +302,34 @@ tedge mqtt pub 'te/device/main/service/nodered/m/environment' '{"temperature":23
 }
 ```
 
+</details>
+
+
+<details>
+<summary>Service of a child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01/service/nodered/m/environment' '{"temperature":23.4}'
+```
+
+```json title="Output Topic: c8y/measurement/measurements/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01:service:nodered",
+    "type": "c8y_Serial"
+  },
+  "temperature": {
+    "temperature": {
+      "unit": "",
+      "value": 23.4
+    }
+  },
+  "time": "2023-07-07T13:52:40.927797+02:00",
+  "type": "environment"
+}
+```
+</details>
+
 ### Events
 
 #### Main device
@@ -309,7 +341,7 @@ tedge mqtt pub 'te/device/main///e/flow_status' '{"text":"Low flow detected"}'
 ```json title="Output Topic: c8y/event/events/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main",
+    "externalId": "tedge_001",
     "type": "c8y_Serial"
   },
   "text": "Low flow detected",
@@ -318,7 +350,29 @@ tedge mqtt pub 'te/device/main///e/flow_status' '{"text":"Low flow detected"}'
 }
 ```
 
-#### Service of a main device
+<details>
+<summary>Child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01///e/flow_status' '{"text":"Low flow detected"}'
+```
+
+```json title="Output Topic: c8y/event/events/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01",
+    "type": "c8y_Serial"
+  },
+  "text": "Low flow detected",
+  "time": "2023-07-07T16:50:35.935371+02:00",
+  "type": "flow_status"
+}
+```
+
+</details>
+
+<details>
+<summary>Service of a main device</summary>
 
 ```sh te2mqtt
 tedge mqtt pub 'te/device/main/service/nodered/e/flow_status' '{"text":"Low flow detected"}'
@@ -336,6 +390,29 @@ tedge mqtt pub 'te/device/main/service/nodered/e/flow_status' '{"text":"Low flow
 }
 ```
 
+</details>
+
+<details open>
+<summary>Service of a child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01/service/nodered/e/flow_status' '{"text":"Low flow detected"}'
+```
+
+```json title="Output Topic: c8y/event/events/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01:service:nodered",
+    "type": "c8y_Serial"
+  },
+  "text": "Low flow detected",
+  "time": "2023-07-07T16:51:42.525765+02:00",
+  "type": "flow_status"
+}
+```
+
+</details>
+
 ### Alarms
 
 #### Main device
@@ -347,7 +424,7 @@ tedge mqtt pub 'te/device/main///a/disk_usage' '{"text":"Disk space is low"}'
 ```json title="Output Topic: c8y/alarm/alarms/create"
 {
   "externalSource": {
-    "externalId": "tedge_001:device:main",
+    "externalId": "tedge_001",
     "type": "c8y_Serial"
   },
   "severity": "CRITICAL",
@@ -357,7 +434,32 @@ tedge mqtt pub 'te/device/main///a/disk_usage' '{"text":"Disk space is low"}'
 }
 ```
 
-#### Service of a main device
+
+<details>
+<summary>Child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01///a/health' '{"text":"Service is stopped"}'
+```
+
+```json title="Output Topic: c8y/alarm/alarms/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01",
+    "type": "c8y_Serial"
+  },
+  "severity": "CRITICAL",
+  "text": "Service is stopped",
+  "time": "2023-07-07T17:01:12.553921+02:00",
+  "type": "health"
+}
+```
+
+</details>
+
+
+<details>
+<summary>Service of a main device</summary>
 
 ```sh te2mqtt
 tedge mqtt pub 'te/device/main/service/nodered/a/health' '{"text":"Service is stopped"}'
@@ -375,6 +477,30 @@ tedge mqtt pub 'te/device/main/service/nodered/a/health' '{"text":"Service is st
   "type": "health"
 }
 ```
+
+</details>
+
+<details>
+<summary>Service of a child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01/service/nodered/a/health' '{"text":"Service is stopped"}'
+```
+
+```json title="Output Topic: c8y/alarm/alarms/create"
+{
+  "externalSource": {
+    "externalId": "tedge_001:device:child01:service:nodered",
+    "type": "c8y_Serial"
+  },
+  "severity": "CRITICAL",
+  "text": "Service is stopped",
+  "time": "2023-07-07T17:01:12.553921+02:00",
+  "type": "health"
+}
+```
+
+</details>
 
 ### Data (inventory data)
 
@@ -398,6 +524,79 @@ tedge mqtt pub 'te/device/main///data/os_information' '{
 }
 ```
 
+
+<details>
+<summary>Child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01///data/os_information' '{
+  "family":"Debian",
+  "codename":"bullseye",
+  "version":"11"
+}'
+```
+
+```json title="Output Topic: c8y/inventory/managedObjects/update/tedge_001:device:child01"
+{
+  "os_information": {
+    "codename": "bullseye",
+    "family": "Debian",
+    "version": "11"
+  }
+}
+```
+
+</details>
+
+
+<details>
+<summary>Service of a main device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/main/service/nodered/data/os_information' '{
+  "family":"Debian",
+  "codename":"bullseye",
+  "version":"11"
+}'
+```
+
+```json title="Output Topic: c8y/inventory/managedObjects/update/tedge_001:device:main:service:nodered"
+{
+  "os_information": {
+    "codename": "bullseye",
+    "family": "Debian",
+    "version": "11"
+  }
+}
+```
+
+</details>
+
+
+<details>
+<summary>Service of a child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01/service/nodered/data/os_information' '{
+  "family":"Debian",
+  "codename":"bullseye",
+  "version":"11"
+}'
+```
+
+```json title="Output Topic: c8y/inventory/managedObjects/update/tedge_001:device:child01:service:nodered"
+{
+  "os_information": {
+    "codename": "bullseye",
+    "family": "Debian",
+    "version": "11"
+  }
+}
+```
+
+</details>
+
+
 #### Updating root fragment
 
 If a fragments on the root level need to be updated, then leave the `type` topic segment blank, and it will apply all of the given property on the root level.
@@ -412,7 +611,28 @@ tedge mqtt pub 'te/device/main/service/nodered/data/' '{"displayName":"My Custom
 }
 ```
 
-#### Service of a main device
+<details>
+<summary>Child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01///data/container_runtime' '{
+  "status":"running"
+}'
+```
+
+```json title="Output Topic: c8y/inventory/managedObjects/update/tedge_001:device:child01"
+{
+  "container_runtime": {
+    "status": "running"
+  }
+}
+```
+
+</details>
+
+
+<details>
+<summary>Service of a main device</summary>
 
 ```sh te2mqtt
 tedge mqtt pub 'te/device/main/service/nodered/data/container_runtime' '{
@@ -427,6 +647,28 @@ tedge mqtt pub 'te/device/main/service/nodered/data/container_runtime' '{
   }
 }
 ```
+
+</details>
+
+
+<details>
+<summary>Service of a child device</summary>
+
+```sh te2mqtt
+tedge mqtt pub 'te/device/child01/service/nodered/data/container_runtime' '{
+  "status":"running"
+}'
+```
+
+```json title="Output Topic: c8y/inventory/managedObjects/update/tedge_001:device:child01:service:nodered"
+{
+  "container_runtime": {
+    "status": "running"
+  }
+}
+```
+
+</details>
 
 ### Operations
 
@@ -551,6 +793,27 @@ tedge mqtt pub 'c8y/devicecontrol/notifications' '{
   "status":"pending"
 }
 ```
+
+## Summary
+
+### Advantages
+
+* Get the entity/component list out of the box
+  * User just has to publish retain messages, e.g. publish to `te/device/main` or `te/device/main/service/nodered`
+
+* Normalized topic structure. This makes it easier for other components to observe the data
+
+* Decouple topic hierarchy from entity hierarchy
+  * Multiple devices could publish to the same cloud entity (if you wanted), yet keeping the data separate on the local MQTT broker
+
+* Enable users to define their own semantic meanings to the 4-segment topic hierarchy
+
+* Also allows for entity/component inference when using configurable (magic) namespace names which will map a namespace to an entity type
+
+
+### Disadvantages
+
+* Longer topic structure
 
 ## Open Questions
 
