@@ -29,7 +29,7 @@ tedge mqtt pub -r 'te/device/main///m/' '{
 ### Publish to a child device
 
 ```sh te2mqtt
-tedge mqtt pub -r 'te/child/child01///m/environment' '{
+tedge mqtt pub -r 'te/device/child01///m/environment' '{
   "temperature": 23.4
 }'
 ```
@@ -219,10 +219,10 @@ assert get_external_id("te/device/main///m/environment") == "tedge_001"
 assert get_external_id("te/device/main/service/nodered/m/environment") == "tedge_001:device:main:service:nodered"
 
 # Child device
-assert get_external_id("te/child/child01///m/environment") == "tedge_001:child:child01"
+assert get_external_id("te/device/child01///m/environment") == "tedge_001:child:child01"
 
 # Service on child device
-assert get_external_id("te/child/child01/service/nodered/m/environment") == "tedge_001:child:child01:service:nodered"
+assert get_external_id("te/device/child01/service/nodered/m/environment") == "tedge_001:child:child01:service:nodered"
 ```
 
 ### Measurements

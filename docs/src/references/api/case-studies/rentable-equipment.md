@@ -87,17 +87,17 @@ The pump can be registered using a custom id, however it will still follow the t
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/flowserve/AF012345' '{
-  "@id": "te:flowserve:AF012345",
+  "@id": "te/flowserve/AF012345",
   "@type": "child-device"
 }'
 ```
 
-The pump should be identifiable in the Cloud IoT via `te:flowserve:AF012345`. It will **NOT** include thin-edge's device-id (e.g. the device certificate's CommonName field).
+The pump should be identifiable in the Cloud IoT via `te:flowserve:AF012345` (where slashes `/` are replaced with `:`). It will **NOT** include thin-edge's device-id (e.g. the device certificate's CommonName field).
 
 :::tip
-The `@id` fields should not use slashes `/` in its name. This is because a slash can often cause problems with other API offered by IoT platforms, for example REST API.
+The `@id` fields can use slashes `/` in their name, however the name will be normalized when communicating with IoT Platforms to improve the compatibility with other API (e.g. REST API). The nro
 
-To avoid this, just replace slash `/` with a colon `:`.
+The `@id` normalization just involves replacing slashes `/` with a colon `:`.
 :::
 
 #### Register telemetry meta data
@@ -200,7 +200,7 @@ mosquitto_sub -t 'te/+/+' -F '{"%t":%p}' -W 1 | jq -s 'add'
     "displayName": "nested_child01"
   },
   "te/flowserve/AF012345": {
-    "@id": "te:flowserve:AF012345",
+    "@id": "te/flowserve/AF012345",
     "@type": "child-device"
   }
 }
@@ -230,7 +230,7 @@ mosquitto_sub -t 'te/+/+' -t 'te/+/+/+/+' -F '{"%t":%p}' -W 1 | jq -s 'add'
     "displayName": "nested_child01"
   },
   "te/flowserve/AF012345": {
-    "@id": "te:flowserve:AF012345",
+    "@id": "te/flowserve/AF012345",
     "@type": "child-device"
   },
   "te/device/child01/service/tedge-agent": {

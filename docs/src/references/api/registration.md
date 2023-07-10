@@ -22,14 +22,16 @@ The following diagram illustrates the manual registration process.
 
 ```mermaid
 sequenceDiagram
-    ChildConnector->>MQTTBroker: Publish registration message to te/child/child01
+    ChildConnector->>MQTTBroker: Publish registration message to te/device/child01
     MQTTBroker->>Mapper: Receive registration message
     Mapper->>Cloud: Register device
     Cloud-->>Mapper: Device registered
 
-    ChildConnector->>MQTTBroker: Publish telemetry data to te/child/child01///m/example
+    ChildConnector->>MQTTBroker: Publish telemetry data to te/device/child01///m/example
     MQTTBroker->>Mapper: Receive telemetry message
-    Mapper->>Cloud: Publish telemetry message
+    alt Device/service is registered
+      Mapper->>Cloud: Publish telemetry message
+    end
 ```
 
 ### Auto Registration
@@ -40,9 +42,9 @@ The following sequence diagram illustrates the automatic registration of a new c
 
 ```mermaid
 sequenceDiagram
-    ChildConnector->>MQTTBroker: Publish telemetry data to te/child/child01///m/example
+    ChildConnector->>MQTTBroker: Publish telemetry data to te/device/child01///m/example
     MQTTBroker->>Mapper: Receive telemetry message
-    Mapper->>Mapper: Store telemetry message
+    Mapper->>Mapper: Defer telemetry message (in memory storage)
     Mapper->>Mapper: Infer entity/component from topic
     Mapper ->> MQTTBroker: Publish registration message
 
@@ -51,9 +53,11 @@ sequenceDiagram
     Cloud-->>Mapper: Device registered
     Mapper->>Cloud: Publish deferred telemetry message
 
-    ChildConnector->>MQTTBroker: Publish telemetry data to te/child/child01///m/example
+    ChildConnector->>MQTTBroker: Publish telemetry data to te/device/child01///m/example
     MQTTBroker->>Mapper: Receive telemetry message
-    Mapper->>Cloud: Publish telemetry message
+    alt Device/service is registered
+      Mapper->>Cloud: Publish telemetry message
+    end
 ```
 
 ### Inference of types by topic prefixes
@@ -115,17 +119,6 @@ tedge mqtt pub -r 'te/device/child01' '{
 }'
 ```
 
-:::note Alternative convention
-The entity namespace could be changed from `device` to `child` to represent that it is a child device:
-
-```sh te2mqtt
-tedge mqtt pub -r 'te/child/child01' '{
-  "@type": "child-device",
-  "displayName": "child01"
-}'
-```
-:::
-
 ### Example: Register a nested child device
 
 A nested child device could be registered by providing the type and id of the parent device. This would all an entity to be assign to any other entity (if the other entity supports such relationships).
@@ -137,24 +130,6 @@ tedge mqtt pub -r 'te/device/nested_child01' '{
   "displayName": "nested_child01"
 }'
 ```
-
-:::note Alternative solution
-Or an alternative syntax which is in more inline with Azure IoT, uses a generic relationship description.
-
-```sh te2mqtt
-tedge mqtt pub -r 'te/device/nested_child01' '{
-  "@type": "child-device",
-  "@parent": "te/device/child01",
-  "displayName": "nested_child01",
-  "contents": [
-    {
-      "@type": "ChildRelationship",
-      "target": "te/device/child01"
-    }
-  ]
-}'
-```
-:::
 
 ### Example: Register a service of the main device
 
