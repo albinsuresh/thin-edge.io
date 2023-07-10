@@ -42,14 +42,14 @@ The following sequence diagram illustrates the automatic registration of a new c
 sequenceDiagram
     ChildConnector->>MQTTBroker: Publish telemetry data to te/child/child01///m/example
     MQTTBroker->>Mapper: Receive telemetry message
-    Mapper->>Mapper: Defer telemetry message
+    Mapper->>Mapper: Store telemetry message
     Mapper->>Mapper: Infer entity/component from topic
     Mapper ->> MQTTBroker: Publish registration message
 
     MQTTBroker-->>Mapper: Receive registration message
     Mapper->>Cloud: Register device
     Cloud-->>Mapper: Device registered
-    Mapper->>Cloud: Publish telemetry message
+    Mapper->>Cloud: Publish deferred telemetry message
 
     ChildConnector->>MQTTBroker: Publish telemetry data to te/child/child01///m/example
     MQTTBroker->>Mapper: Receive telemetry message
