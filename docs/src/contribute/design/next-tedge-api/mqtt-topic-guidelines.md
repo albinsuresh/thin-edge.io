@@ -1,3 +1,10 @@
+---
+title: Topic Design
+tags: [Documentation]
+slug: topic-design
+sidebar_position: 1
+---
+
 # MQTT Topic Guidelines
 
 This document provides the guidelines for designing MQTT topic structures for thin-edge itself and its extensions.
@@ -14,7 +21,7 @@ Here are a few such examples:
 1. Topic for firmware update commands: `tedge/{child-id}/commands/req/firmware_update`
 1. Topic for software update commands: `tedge/commands/req/software/list`
 
-... where there is inconsistency in the placement of child devices and how the commands are grouped.
+Where there is inconsistency in the placement of child devices and how the commands are grouped.
 
 There are a few other limitations like the lack of support for services on the thin-edge device,
 difficulty in extending existing topics with additional sub-topics, etc
@@ -106,11 +113,11 @@ Even the sensors attached at many levels in such a complex deployment may have t
 
 So, the proposed solutions must address such ID clashes in a deep nested hierarchies.
 
-```admonish NOTE
+:::info
 Even the parent-child `id` combination for all devices is not unique in this deployment,
 as you can see that the temperature sensors on the brakes of both front wheel and rear wheel
 have a parent-child ID combination of `BRAKE-ECU-B001/TEMP-0001`
-```
+:::
 
 # Use-cases
 
@@ -244,7 +251,7 @@ This section is divided into 3 parts:
 ## Nice-to have
 
 1. Avoid using the device id in the topics for the main tedge device to keep those well-known topics simple.
-   Use aliases like `main` or `master` instead, if an identifier is really required.
+   Use aliases like `main` or `root` instead, if an identifier is really required.
    Using `id`s for child devices might be unavoidable.
 1. Consistency/symmetry in the topic structures for the main device, child device and services.
    For e.g: if the telemetry topic for a child device is like: `tedge/level2/level3/level4/telemetry/...`
@@ -309,7 +316,7 @@ with simple subscription filters like `tedge/main/device/#`.
 Without that device suffix, something like `tedge/main/#` would include the services' data as well.
 
 
-**Why have the `/service/` subtopic level and not have the <service-id> directly?**
+**Why have the /service/ subtopic level and not have the service-id directly?**
 
 Primarily for future-proofing as `service` is a new kind of child abstraction that we've added now.
 If another abstraction is introduced in the future, say `plugin`, they can be namespaced under a `plugin/` subtopic.
@@ -428,7 +435,7 @@ by sending the following MQTT message to the topic: `tedge/main/register/req/chi
    "capabilities": {
       "<capability-1>": {},  //capability-1 specific metadata
       "<capability-2>": {},  //capability-2 specific metadata
-      ...
+      // ...
    }
 }
 ```
@@ -436,10 +443,10 @@ by sending the following MQTT message to the topic: `tedge/main/register/req/chi
 The `parent-device-id` is the device-id of the direct parent that the child device is connected to.
 The payload can have other fields describing the capabilities of that device as well (config management, software management etc).
 
-```admonish warning
+:::caution
 The exact topic keys and payload format for this init contract can be discussed and refined separately.
 The focus here is just on the MQTT topic structure.
-```
+:::
 
 Thin-edge needs to maintain the lineage (hierarchy of parent devices) of all descendent child devices in its internal state,
 so that it can be looked up while receiving any data from them.
@@ -572,9 +579,9 @@ Examples:
 * Child device measurements: `tedge/<child-device-id>/telemetry/measurements`
 * Child device service measurements: `tedge/<child-service-id>/telemetry/measurements`
 
-```admonish note
+:::info
 `tedge/main` could be just used as an alias for `tedge/<tedge-device-id>` for simplicity.
-```
+:::
 
 **Pros**
 
@@ -631,6 +638,7 @@ But thin-edge has some pre-defined `<data-type>` subtopics for well-known types 
 |Measurements|`<entity_id_prefix>/m/[/<measurement-type>]`|
 |Events|`<entity_id_prefix>/e/<event-type>`|
 |Alarms|`<entity_id_prefix>/a/<alarm-type>`|
+|Data (Inventory)|`<entity_id_prefix>/data/<data-type>`|
 
 **Subtopics for predefined commands**
 
@@ -752,7 +760,7 @@ Nested child devices must always register explicitly by declaring their `parent`
 
 If an explicit registration is not done, thin-edge will assume the following topic level convention:
 
-```
+```text
 te/<device-namespace>/<device-id>/<service-namespace>/<service-id>
 ```
 
@@ -760,8 +768,8 @@ and auto-register the entities as per their positions in the topics.
 
 For example, if the following measurement message is received without any explicit registrations,
 
-```
-te/abc_device_namespace/Rpi1001/xyz_service_namespace/collectd/m/cpu_usage
+```text
+te/abc/Rpi1001/xyz/collectd/m/cpu_usage
 ```
 
 `Rpi1001` and `collectd` will be auto-registered as `device` and `service` types,
@@ -788,7 +796,17 @@ The metadata fields supported by each data type will be defined in detail later.
 
 ### Backward compatibility
 
-**TBD** How old topics can be mapped to new
+A compatibility layer should be implemented to map the existing (legacy) tedge topics to the new topic structure. It is important that the layer translate from the legacy to the new so that both existing and new entities/components are both observable via the new topics.
+
+The compatibility layer should be able to be deactivated via configuration after all entities/components have been migrated.
+
+Below details some examples showing the mapping between the legacy and new topics:
+
+|Legacy topic|New topic|Notes|
+|------------|---------|-----|
+|`tedge/measurement`|`tedge/device/main///m/ThinEdgeMeasurement`|
+|`tedge/events/<type>`|`tedge/device/main///e/<type>`|
+|`tedge/alarms/<severity>/<type>`|`tedge/device/main///a/<type>`|Severity will be mapped to the `.severity` property in the payload|
 
 ## Comparison
 
