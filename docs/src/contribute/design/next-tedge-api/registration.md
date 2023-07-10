@@ -14,6 +14,12 @@ Once an entity/component has been automatically registered, then it will behave 
 
 Below shows a comparison between the two registration mechanisms.
 
+:::tip
+The registration message is only meant to contain static information about the entity/component being registered. It should only be published by a single owner to avoid confusion about how the entity/component digital's twin should be represented in the corresponding IoT platform.
+
+Instead, runtime information (like status) should be published to one of the telemetry data types.
+:::
+
 ### Manual Registration
 
 Manual registration requires the entity/device to first before telemetry data can be published.
@@ -67,6 +73,12 @@ Automatic registration relies on entities and components publishing to declared 
 The topic structure is used to infer the entity and component type by matching it against some pre-defined names. The pre-defined topic structure follows the following semantics:
 
 ```text
+te/device/<device-id>/service/<name>
+```
+
+Where the `<device-id>` is either `main` (representing the thin-edge device), or a child device id
+
+```text
 te/device/[main|<other>]/service/<name>
 ```
 
@@ -86,11 +98,10 @@ You can apply your own semantic meaning to the topic segments, however it will r
 
 See the [Advanced examples](#advanced-examples) for more details.
 :::
-You can apply your own 
 
 ## Examples
 
-### Example: Register a device
+### Register a device
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/device/main' '{
@@ -109,7 +120,7 @@ tedge mqtt pub -r 'te/device/main' '{
 }'
 ```
 
-### Example: Register a child device
+### Register a child device
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/device/child01' '{
@@ -119,7 +130,7 @@ tedge mqtt pub -r 'te/device/child01' '{
 }'
 ```
 
-### Example: Register a nested child device
+### Register a nested child device
 
 A nested child device could be registered by providing the type and id of the parent device. This would all an entity to be assign to any other entity (if the other entity supports such relationships).
 
@@ -131,7 +142,7 @@ tedge mqtt pub -r 'te/device/nested_child01' '{
 }'
 ```
 
-### Example: Register a service of the main device
+### Register a service of the main device
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/device/main/service/nodered' '{
@@ -142,7 +153,7 @@ tedge mqtt pub -r 'te/device/main/service/nodered' '{
 }'
 ```
 
-### Example: Register a service of a child device
+### Register a service of a child device
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/device/child01/service/nodered' '{
@@ -153,7 +164,7 @@ tedge mqtt pub -r 'te/device/child01/service/nodered' '{
 }'
 ```
 
-### Example: Register a service of a nested child device
+### Register a service of a nested child device
 
 ```sh te2mqtt
 tedge mqtt pub -r 'te/device/nested_child01/service/nodered' '{
@@ -166,13 +177,13 @@ tedge mqtt pub -r 'te/device/nested_child01/service/nodered' '{
 
 ## Using the data
 
-### Example: Get a list of all devices (main/child)
+### Get a list of all devices (main/child)
 
 ```sh te2mqtt
 tedge mqtt sub 'te/+/+'
 ```
 
-### Example: Get a list of all components
+### Get a list of all components
 
 ```sh te2mqtt
 tedge mqtt sub 'te/+/+/+/+'

@@ -841,22 +841,6 @@ tedge mqtt pub 'c8y/devicecontrol/notifications' '{
     * Two entities/components publishing to the same cloud entity
     * Custom names
 
-5. What format should the `@parent` device be referred to, the `@id` or the topic name?
-
-  For example:
-  * `te/device/nested_child01`
-  or 
-  * `te:device:nested_child01`
-
-  ```json
-  "te/device/nested_child01/service/nodered": {
-    "@type": "service",
-    "@parent": "te/device/nested_child01",
-    "displayName": "nodered",
-    "type": "systemd"
-  }
-  ```
-
 6. Device registration: Should users be allows to register a component under `te/my/component`, a topic which is normally reserved for devices?
 
 7. How to register supported operations

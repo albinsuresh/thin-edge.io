@@ -60,10 +60,10 @@ te/[ManufacturerId]/[SerialNumber]/[Application]/[Instance]/[Channel]
 
 |Segment|Description|
 |-------|-----------|
-|`ManufacturerId`|Manufacturer id. Either the name of a unique code representing the manufacturer|
-|`SerialNumber`|Device serial number (or part number)|
-|`Application`|Optional application name to indicate which data is transmitting the data to the consumers. It can be left blank|
-|`Instance`|If multiple instances of the application, then it can be used to indicate which instance of the application is the telemetry data representing. It can be left blank|
+|ManufacturerId|Manufacturer id. Either the name of a unique code representing the manufacturer|
+|SerialNumber|Device serial number (or part number)|
+|Application|Optional application name to indicate which data is transmitting the data to the consumers. It can be left blank|
+|Instance|If multiple instances of the application, then it can be used to indicate which instance of the application is the telemetry data representing. It can be left blank|
 
 :::info
 The manufacturer id is used to namespace the device serial numbers as the serial numbers are not guaranteed to be unique between different manufacturers, however it is generally unique within a single manufacturer, and if this is not the case the model number could also be added as a prefix to the `SerialNumber` segment).
@@ -95,9 +95,7 @@ tedge mqtt pub -r 'te/flowserve/AF012345' '{
 The pump should be identifiable in the Cloud IoT via `te:flowserve:AF012345` (where slashes `/` are replaced with `:`). It will **NOT** include thin-edge's device-id (e.g. the device certificate's CommonName field).
 
 :::tip
-The `@id` fields can use slashes `/` in their name, however the name will be normalized when communicating with IoT Platforms to improve the compatibility with other API (e.g. REST API). The nro
-
-The `@id` normalization just involves replacing slashes `/` with a colon `:`.
+Each cloud mapper is free to normalize the `@id` field to suite the requirements of the corresponding IoT Platform. For example it is common that the slashes `/` are replaced with colons `:` so that the id's are compatible with additional non-MQTT based API also offered by the IoT Platform (for example REST API).
 :::
 
 #### Register telemetry meta data
