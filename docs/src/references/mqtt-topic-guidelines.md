@@ -598,33 +598,39 @@ This scheme splits the topic levels into two parts:
 * data type identification levels
 
 This scheme reserves 4 subtopic levels for entity identification,
-and 2 levels for data type identification such as measurements, alarms, events, commands etc as follows:
+and 2 levels for data type identification such as measurements, alarms, events, commands etc.
+
+One way to model the topics would be as follows:
 
 ```
-te/<name-space-1>/<name-space-2>/<name-space-3>/<name-space-4>/<data-type>/<data-instance-type>
+te/<entity-namespace>/<entity-id>/<component-namespace>/<component-id>/<data-type>/<data-instance-type>
 ```
 
-Having 4 levels for entity identification provides enough flexibility
-to better namespace the devices and applications running on it minimizing the risk of `id` conflicts.
-Thin-edge doesn't enforce/dictate how a user uses these namespace levels.
-But there are conventions that can be followed to cover a wide range of use-cases, as follows:
+Where 2 subtopics are used to identify top level entities like devices,
+and the 2 further subtopics are used to identify components on those entities like servcies on devices.
+But, thin-edge doesn't enforce/dictate this scheme.
+The users are free to model the topic levels as per their requirements.
+Here are a few alternative ways to model the topic levels:
 
 * `te/<device-namespace>/<device-id>/<service-namespace>/<service-id>/...`
 * `te/<device-namespace>/<device-id>/<device-local-namespace>/<device-local-component-id>/...`
-* `te/<entity-namespace>/<entity-id>/<component-namespace>/<component-id>/...`
 * `te/<device-family>/<device-series>/<part-series>/<part-id>/...`
+* `te/<parent-device>/<1st-level-child-device>/<2nd-level-child-device>/<service-id>/...`
+
+Having 4 levels for entity identification provides enough flexibility to model various usecases
+with separate namespaces for devices and applications running on them, minimizing the risk of `id` conflicts.
 
 Even for the data type levels, a user is free to define those as they wish.
-But thin-edge has some pre-defined `<data-type>` subtopics for well-known types like:
-`measurements`, `alarms`, `events` and `commands`, on which it enforces some constraints.
+But thin-edge has some pre-defined `<data-type>` subtopics for well-known types like
+*measurements*, *alarms*, *events* and *commands*, on which it enforces some constraints.
 
 **Subtopics for predefined telemetry data**
 
 |Type|Example|
 |------|-------|
-|Measurements|`<entity_id_prefix>/mes/[/<measurement-type>]`|
-|Events|`<entity_id_prefix>/evn/<event-type>`|
-|Alarms|`<entity_id_prefix>/alr/<alarm-type>`|
+|Measurements|`<entity_id_prefix>/m/[/<measurement-type>]`|
+|Events|`<entity_id_prefix>/e/<event-type>`|
+|Alarms|`<entity_id_prefix>/a/<alarm-type>`|
 
 **Subtopics for predefined commands**
 
@@ -681,7 +687,7 @@ Examples:
 * Device measurement:
 
    ```sh te2mqtt
-   tedge mqtt pub -r te/_/Rpi1001/_/_/mes/battery_reading` '{
+   tedge mqtt pub -r te/_/Rpi1001/_/_/m/battery_reading` '{
       "charge": 88
       "temperature": 32,
       "voltage": 45,
@@ -692,7 +698,7 @@ Examples:
 * Service measurement
 
    ```sh te2mqtt
-   tedge mqtt pub -r te/_/Rpi1001/_/tedge-agent/mes/cpu_usage` '{
+   tedge mqtt pub -r te/_/Rpi1001/_/tedge-agent/m/cpu_usage` '{
       "usage": 23
       "threads": 36,
       "up_time": 3726,
@@ -702,7 +708,7 @@ Examples:
 If the the user had used a different entity identification scheme like
 `te/<device-family>/<device-series>/<part-series>/<part-id>/...` instead,
 where the `<part-id>` is the unique device identifier,
-the registration message should have to be sent to the ``te/<device-family>/<device-series>/<part-series>/<part-id>` topic,
+the registration message should have to be sent to the `te/<device-family>/<device-series>/<part-series>/<part-id>` topic,
 with the `type` as `device`.
 
 So, it is completely up-to the user to choose how many levels he wants to uniquely identify devices and services.
@@ -726,7 +732,7 @@ The main device does not need any explicit registration and can be referred to u
 Hence, a measurement associated to the main device can be sent to following topic:
 
 ```
-te/_/main/_/_/mes/battery_reading
+te/_/main/_/_/m/battery_reading
 ```
 
 But if some additional metadata needs to be added to the main device,
@@ -755,7 +761,7 @@ and auto-register the entities as per their positions in the topics.
 For example, if the following measurement message is received without any explicit registrations,
 
 ```
-te/abc_device_namespace/Rpi1001/xyz_service_namespace/collectd/mes/cpu_usage
+te/abc_device_namespace/Rpi1001/xyz_service_namespace/collectd/m/cpu_usage
 ```
 
 `Rpi1001` and `collectd` will be auto-registered as `device` and `service` types,
@@ -769,7 +775,7 @@ For example, the units associated with measurements in the `battery_reading` mea
 can be updated by publishing the following message:
 
 ```sh te2mqtt
-tedge mqtt pub -r te/_/Rpi1001/_/_/mes/battery_reading/meta '{
+tedge mqtt pub -r te/_/Rpi1001/_/_/m/battery_reading/meta '{
   "units": {
     "temperature": "C",
     "voltage": "V",
@@ -779,6 +785,10 @@ tedge mqtt pub -r te/_/Rpi1001/_/_/mes/battery_reading/meta '{
 ```
 
 The metadata fields supported by each data type will be defined in detail later.
+
+### Backward compatibility
+
+**TBD** How old topics can be mapped to new
 
 ## Comparison
 
