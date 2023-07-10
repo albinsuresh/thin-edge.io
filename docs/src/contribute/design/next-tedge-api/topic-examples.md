@@ -1,7 +1,7 @@
 ---
-title: MQTT Topic Structure
+title: Topic Examples
 tags: [Documentation]
-sidebar_position: 1
+sidebar_position: 2
 ---
 
 # Examples
