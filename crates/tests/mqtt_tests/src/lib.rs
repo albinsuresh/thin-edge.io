@@ -9,4 +9,5 @@ pub use message_streams::*;
 pub use test_mqtt_client::assert_received;
 pub use test_mqtt_client::assert_received_all_expected;
 pub use test_mqtt_client::publish;
+pub use test_mqtt_client::publish_with_defaults;
 pub use test_mqtt_server::test_mqtt_broker;

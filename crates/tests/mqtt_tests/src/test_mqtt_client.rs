@@ -107,6 +107,14 @@ pub async fn publish(
     con.publish(topic, qos, retain, payload).await
 }
 
+pub async fn publish_with_defaults(
+    mqtt_port: u16,
+    topic: &str,
+    payload: &str,
+) -> Result<(), anyhow::Error> {
+    publish(mqtt_port, topic, payload, QoS::AtLeastOnce, false).await
+}
+
 /// Publish the `pub_message` on the `pub_topic` only when ready to receive a message on `sub_topic`.
 ///
 /// 1. Subscribe to the `sub_topic`,

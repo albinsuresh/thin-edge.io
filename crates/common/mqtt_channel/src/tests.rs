@@ -4,6 +4,9 @@ use futures::StreamExt;
 use serial_test::serial;
 use std::convert::TryInto;
 use std::time::Duration;
+use testcontainers::core::WaitFor;
+use testcontainers::runners::AsyncRunner;
+use testcontainers::GenericImage;
 
 const TIMEOUT: Duration = Duration::from_millis(1000);
 
@@ -62,6 +65,57 @@ async fn next_message(received: &mut (impl StreamExt<Item = MqttMessage> + Unpin
         Ok(None) => MaybeMessage::Eos,
         Err(_elapsed) => MaybeMessage::Timeout,
     }
+}
+
+#[tokio::test]
+#[serial]
+async fn mosquitto_broker_test() -> Result<(), anyhow::Error> {
+    let container = GenericImage::new("efrecon/mosquitto", "2.0.18")
+        .with_exposed_port(1883)
+        .with_env_var("MOSQUITTO_LISTENER", "1883")
+        .with_env_var("MOSQUITTO_ALLOW_ANONYMOUS", "true")
+        .with_wait_for(WaitFor::message_on_stderr(
+            "mosquitto version 2.0.18 starting",
+        ))
+        .start()
+        .await
+        .expect("Mosquitto started");
+
+    // tokio::time::sleep(Duration::from_secs(5)).await;
+    // dbg!(std::str::from_utf8(&container.stdout_to_vec().await.unwrap()).unwrap());
+    // dbg!(std::str::from_utf8(&container.stderr_to_vec().await.unwrap()).unwrap());
+
+    let broker_port = container.get_host_port_ipv4(1883).await.unwrap();
+    let bridge_ip = container.get_bridge_ip_address().await.unwrap();
+    dbg!(&bridge_ip);
+
+    let mqtt_config = Config::default()
+        .with_host(bridge_ip.to_string())
+        .with_port(broker_port);
+    let topic = "a/test/topic";
+    let mqtt_config = mqtt_config
+        .with_session_name("test_client")
+        .with_subscriptions(topic.try_into()?);
+    let mut subscriber = Connection::new(&mqtt_config).await?;
+
+    subscriber
+        .published
+        .send(MqttMessage::new(&topic.try_into()?, "msg 1"))
+        .await
+        .unwrap();
+
+    // Any messages published on that topic ...
+    mqtt_tests::publish_with_defaults(broker_port, topic, "msg 1")
+        .await
+        .unwrap();
+
+    // ... must be received by the client
+    // assert_eq!(
+    //     MaybeMessage::Next(message(topic, "msg 1")),
+    //     next_message(&mut subscriber.received).await
+    // );
+
+    Ok(())
 }
 
 #[tokio::test]
