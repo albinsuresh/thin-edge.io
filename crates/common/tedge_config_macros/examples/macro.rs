@@ -15,6 +15,26 @@ pub enum ReadError {
     GenericError(String),
 }
 
+pub trait AppendRemoveItem {
+    type Item;
+
+    fn append(current_value: Option<Self::Item>, new_value: Self::Item) -> Option<Self::Item>;
+
+    fn remove(current_value: Option<Self::Item>, remove_value: Self::Item) -> Option<Self::Item>;
+}
+
+impl<T> AppendRemoveItem for T {
+    type Item = T;
+
+    fn append(_current_value: Option<Self::Item>, _new_value: Self::Item) -> Option<Self::Item> {
+        unimplemented!()
+    }
+
+    fn remove(_current_value: Option<Self::Item>, _remove_value: Self::Item) -> Option<Self::Item> {
+        unimplemented!()
+    }
+}
+
 define_tedge_config! {
     #[tedge_config(reader(skip))]
     config: {
@@ -96,7 +116,7 @@ define_tedge_config! {
 
         client: {
             /// The host that the thin-edge MQTT client should connect to
-            #[tedge_config(example = "localhost", default(value = "localhost"))]
+            #[tedge_config(example = "127.0.0.1", default(value = "127.0.0.1"))]
             host: String,
 
             /// The port that the thin-edge MQTT client should connect to

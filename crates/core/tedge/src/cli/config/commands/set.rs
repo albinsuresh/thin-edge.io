@@ -18,7 +18,7 @@ impl Command for SetConfigCommand {
     }
 
     fn execute(&self) -> anyhow::Result<()> {
-        self.config_location.update_toml(&|dto| {
+        self.config_location.update_toml(&|dto, _reader| {
             dto.try_update_str(self.key, &self.value)
                 .map_err(|e| e.into())
         })?;

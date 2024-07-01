@@ -33,7 +33,7 @@ use crate::ConfigManagerBuilder;
 use crate::ConfigManagerConfig;
 use crate::TedgeWriteStatus;
 
-const TEST_TIMEOUT_MS: Duration = Duration::from_secs(5);
+const TEST_TIMEOUT_MS: Duration = Duration::from_secs(3);
 
 type MqttMessageBox = TimedMessageBox<SimpleMessageBox<MqttMessage, MqttMessage>>;
 type DownloaderMessageBox =
@@ -163,7 +163,7 @@ async fn default_plugin_config() {
         type = "tedge-log-plugin"
         user = "tedge"
         group = "tedge"
-        mode = 444
+        mode = 0o644
     };
 
     assert_eq!(plugin_config_toml, expected_config);

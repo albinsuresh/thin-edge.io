@@ -23,6 +23,7 @@ use futures::Sink;
 use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
+use hyper::header::HOST;
 use hyper::HeaderMap;
 use reqwest::Method;
 use reqwest::StatusCode;
@@ -152,6 +153,7 @@ impl From<AppData> for AppState {
             target_host: TargetHost {
                 http: format!("{http}://{host}").into(),
                 ws: format!("{ws}://{host}").into(),
+                without_scheme: host.into(),
             },
             token_manager: value.token_manager,
         }
@@ -174,6 +176,7 @@ impl FromRef<AppState> for SharedTokenManager {
 struct TargetHost {
     http: Arc<str>,
     ws: Arc<str>,
+    without_scheme: Arc<str>,
 }
 
 fn axum_to_tungstenite(message: axum::extract::ws::Message) -> tungstenite::Message {
@@ -217,6 +220,7 @@ async fn connect_to_websocket(
     token: &str,
     headers: &HeaderMap<HeaderValue>,
     uri: &str,
+    host: &TargetHost,
 ) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>, tokio_tungstenite::tungstenite::Error> {
     let mut req = Request::builder();
     for (name, value) in headers {
@@ -225,6 +229,7 @@ async fn connect_to_websocket(
     req = req.header("Authorization", format!("Bearer {token}"));
     let req = req
         .uri(uri)
+        .header(HOST, host.without_scheme.as_ref())
         .body(())
         .expect("Builder should always work as the headers are copied from a previous request, so must be valid");
     tokio_tungstenite::connect_async(req)
@@ -243,11 +248,11 @@ async fn proxy_ws(
     use tungstenite::error::Error;
     let uri = format!("{}/{path}", host.ws);
     let mut token = retrieve_token.not_matching(None).await;
-    let c8y = match connect_to_websocket(&token, &headers, &uri).await {
+    let c8y = match connect_to_websocket(&token, &headers, &uri, &host).await {
         Ok(c8y) => Ok(c8y),
         Err(Error::Http(res)) if res.status() == StatusCode::UNAUTHORIZED => {
             token = retrieve_token.not_matching(Some(&token)).await;
-            match connect_to_websocket(&token, &headers, &uri).await {
+            match connect_to_websocket(&token, &headers, &uri, &host).await {
                 Ok(c8y) => Ok(c8y),
                 Err(e) => {
                     Err(anyhow::Error::from(e).context("Failed to connect to proxied websocket"))
@@ -371,7 +376,7 @@ async fn respond_to(
     path: Option<Path<String>>,
     uri: hyper::Uri,
     method: Method,
-    headers: HeaderMap<HeaderValue>,
+    mut headers: HeaderMap<HeaderValue>,
     ws: Option<WebSocketUpgrade>,
     small_body: crate::body::PossiblySmallBody,
 ) -> Result<Response, ProxyError> {
@@ -385,6 +390,7 @@ async fn respond_to(
         } else {
             |req, token| req.bearer_auth(token)
         };
+    headers.remove(HOST);
 
     // Cumulocity revokes the device token if we access parts of the frontend UI,
     // so deny requests to these proactively
@@ -485,6 +491,8 @@ mod tests {
     use tedge_actors::Server;
     use tedge_actors::ServerActorBuilder;
     use tedge_actors::ServerConfig;
+    use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
@@ -532,6 +540,87 @@ mod tests {
 
     async fn close_connection(ws: WebSocket) {
         ws.close().await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn does_not_forward_host_header_for_http_requests() {
+        let target_host = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_host.local_addr().unwrap();
+
+        let proxy_port = start_server_port(target.port(), vec!["unused token"]);
+        tokio::spawn(async move {
+            let client = reqwest::Client::builder()
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap();
+            client
+                .get(format!("http://127.0.0.1:{proxy_port}/c8y/test"))
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap();
+        });
+
+        let proxy_host = format!("127.0.0.1:{proxy_port}");
+        let destination_host = format!("127.0.0.1:{}", target.port());
+
+        let (mut tcp_stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), target_host.accept())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let request = parse_raw_request(&mut tcp_stream).await;
+
+        tcp_stream
+            .write_all(b"HTTP/1.1 204 No Content")
+            .await
+            .unwrap();
+        assert_eq!(host_header_values(&request), [&destination_host], "Did not find correct host header. The value should be the proxy destination ({destination_host}), not the proxy itself ({proxy_host})");
+    }
+
+    #[tokio::test]
+    async fn does_not_forward_host_header_for_websocket_requests() {
+        let target_host = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_host.local_addr().unwrap();
+
+        let proxy_port = start_server_port(target.port(), vec!["unused token"]);
+        tokio::spawn(async move {
+            connect_to_websocket_port(proxy_port).await;
+        });
+
+        let proxy_host = format!("127.0.0.1:{proxy_port}");
+        let destination_host = format!("127.0.0.1:{}", target.port());
+
+        let (mut tcp_stream, _) =
+            tokio::time::timeout(Duration::from_secs(5), target_host.accept())
+                .await
+                .unwrap()
+                .unwrap();
+
+        let request = parse_raw_request(&mut tcp_stream).await;
+
+        assert_eq!(host_header_values(&request), [&destination_host], "Did not find correct host header. The value should be the proxy destination ({destination_host}), not the proxy itself ({proxy_host})");
+    }
+
+    async fn parse_raw_request(tcp_stream: &mut TcpStream) -> httparse::Request<'static, 'static> {
+        let mut incoming_payload = Vec::with_capacity(10000);
+        tcp_stream.read_buf(&mut incoming_payload).await.unwrap();
+        let headers = Vec::from([httparse::EMPTY_HEADER; 64]).leak();
+        let mut request = httparse::Request::new(headers);
+        request.parse(incoming_payload.leak()).unwrap();
+
+        request
+    }
+
+    fn host_header_values<'a>(request: &httparse::Request<'a, '_>) -> Vec<&'a str> {
+        request
+            .headers
+            .iter()
+            .filter(|header| header.name.to_lowercase() == "host")
+            .map(|header| std::str::from_utf8(header.value).unwrap())
+            .collect::<Vec<_>>()
     }
 
     #[tokio::test]

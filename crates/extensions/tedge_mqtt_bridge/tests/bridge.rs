@@ -37,13 +37,13 @@ fn new_broker_and_client(name: &str, port: u16) -> (AsyncClient, EventLoop) {
         .spawn(move || broker.start().unwrap())
         .unwrap();
     AsyncClient::new(
-        MqttOptions::new(format!("{name}-test-client"), "localhost", port),
+        MqttOptions::new(format!("{name}-test-client"), "127.0.0.1", port),
         10,
     )
 }
 
 async fn start_mqtt_bridge(local_port: u16, cloud_port: u16, rules: BridgeConfig) {
-    let cloud_config = MqttOptions::new("a-device-id", "localhost", cloud_port);
+    let cloud_config = MqttOptions::new("a-device-id", "127.0.0.1", cloud_port);
     let service_name = "tedge-mapper-test";
     let health_topic = format!("te/device/main/service/{service_name}/status/health")
         .as_str()
@@ -497,7 +497,7 @@ fn tedge_mqtt_config(mqtt_port: u16) -> TEdgeConfig {
     let ttd = TempTedgeDir::new();
     let config_loc = TEdgeConfigLocation::from_custom_root(ttd.path());
     config_loc
-        .update_toml(&|dto| {
+        .update_toml(&|dto, _reader| {
             dto.mqtt.client.port = Some(mqtt_port.try_into().unwrap());
             dto.mqtt.bridge.reconnect_policy.initial_interval = Some("0s".parse().unwrap());
             Ok(())
@@ -521,6 +521,7 @@ fn get_rumqttd_config(port: u16) -> Config {
         max_inflight_count: 200,
         auth: None,
         dynamic_filters: false,
+        external_auth: None,
     };
 
     let server_config = ServerSettings {
@@ -541,8 +542,8 @@ fn get_rumqttd_config(port: u16) -> Config {
         id: 0,
         router: router_config,
         cluster: None,
-        console: console_settings,
-        v4: servers,
+        console: Some(console_settings),
+        v4: Some(servers),
         ws: None,
         v5: None,
         bridge: None,

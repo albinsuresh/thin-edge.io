@@ -22,6 +22,7 @@ certificate = { workspace = true }
 clap = { workspace = true, features = [
     "cargo",
     "derive",
+    "env",
     "string",
     "unstable-styles",
 ] }
@@ -39,6 +40,7 @@ rpassword = { workspace = true }
 rumqttc = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+signal-hook = { workspace = true }
 strum_macros = { workspace = true }
 tedge-agent = { workspace = true }
 tedge-apt-plugin = { workspace = true }
