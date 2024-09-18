@@ -8,6 +8,7 @@ use crate::actor::IdUploadRequest;
 use crate::actor::IdUploadResult;
 use crate::actor::PublishMessage;
 use crate::availability::AvailabilityBuilder;
+use crate::dynamic_converter::DynamicMapper;
 use crate::operations::OperationHandler;
 use crate::Capabilities;
 use assert_json_diff::assert_json_include;
@@ -2881,6 +2882,7 @@ pub(crate) fn test_mapper_config(tmp_dir: &TempTedgeDir) -> C8yMapperConfig {
         true,
         AutoLogUpload::Never,
         false,
+        DynamicMapper::try_new(vec![]).unwrap(),
     )
 }
 

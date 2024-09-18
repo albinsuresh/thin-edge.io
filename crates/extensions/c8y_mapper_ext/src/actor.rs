@@ -1,6 +1,7 @@
 use super::config::C8yMapperConfig;
 use super::converter::CumulocityConverter;
 use super::dynamic_discovery::process_inotify_events;
+use crate::dynamic_converter::DynamicMapperError;
 use crate::service_monitor::is_c8y_bridge_established;
 use async_trait::async_trait;
 use c8y_auth_proxy::url::ProxyUrlGenerator;
@@ -306,6 +307,12 @@ impl C8yMapperActor {
                             eprintln!("Processing inotify event failed due to {}", e);
                         }
                     }
+                } else if path.parent()
+                    == Some(self.converter.config.config_dir.join("c8y").as_std_path())
+                {
+                    return Err(RuntimeError::ActorError(Box::new(
+                        DynamicMapperError::RulesOutOfDate,
+                    )));
                 }
             }
             FsWatchEvent::DirectoryCreated(_) | FsWatchEvent::DirectoryDeleted(_) => {}
@@ -365,6 +372,10 @@ impl C8yMapperBuilder {
 
         fs_watcher.connect_sink(
             config.ops_dir.as_std_path().to_path_buf(),
+            &box_builder.get_sender(),
+        );
+        fs_watcher.connect_sink(
+            config.config_dir.as_std_path().join("c8y").to_path_buf(),
             &box_builder.get_sender(),
         );
         let auth_proxy = ProxyUrlGenerator::new(

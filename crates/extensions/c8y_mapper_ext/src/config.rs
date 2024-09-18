@@ -1,3 +1,6 @@
+use crate::dynamic_converter::parse_dynamic_mapping_rules;
+use crate::dynamic_converter::DynamicMapper;
+use crate::dynamic_converter::DynamicMapperError;
 use crate::operations::OperationHandler;
 use crate::Capabilities;
 use c8y_api::json_c8y_deserializer::C8yDeviceControlTopic;
@@ -66,6 +69,8 @@ pub struct C8yMapperConfig {
     pub ops_dir: Arc<Utf8Path>,
     pub state_dir: Arc<Utf8Path>,
     pub tmp_dir: Arc<Utf8Path>,
+
+    pub dynamic_mapper: DynamicMapper,
 }
 
 impl C8yMapperConfig {
@@ -97,6 +102,7 @@ impl C8yMapperConfig {
         software_management_with_types: bool,
         auto_log_upload: AutoLogUpload,
         smartrest_use_operation_id: bool,
+        dynamic_mapper: DynamicMapper,
     ) -> Self {
         let ops_dir = config_dir
             .join(SUPPORTED_OPERATIONS_DIRECTORY)
@@ -143,6 +149,8 @@ impl C8yMapperConfig {
             ops_dir,
             state_dir,
             tmp_dir,
+
+            dynamic_mapper,
         }
     }
 
@@ -218,6 +226,9 @@ impl C8yMapperConfig {
             }
         }
 
+        let dynamic_mapper = parse_dynamic_mapping_rules(config_dir.as_std_path())?;
+        topics.add_all(dynamic_mapper.subscription_topics());
+
         let bridge_in_mapper = tedge_config.mqtt.bridge.built_in;
 
         Ok(C8yMapperConfig::new(
@@ -246,6 +257,7 @@ impl C8yMapperConfig {
             software_management_with_types,
             auto_log_upload,
             smartrest_use_operation_id,
+            dynamic_mapper,
         ))
     }
 
@@ -307,6 +319,9 @@ pub enum C8yMapperConfigBuildError {
 
     #[error(transparent)]
     FromTopicIdError(#[from] TopicIdError),
+
+    #[error(transparent)]
+    FromDynamicMapperError(#[from] DynamicMapperError),
 }
 
 #[derive(thiserror::Error, Debug)]

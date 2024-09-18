@@ -90,6 +90,7 @@ impl TEdgeInitCmd {
         create_directory(config_dir.join("plugins"), &permissions)?;
         create_directory(config_dir.join("sm-plugins"), &permissions)?;
         create_directory(config_dir.join("device-certs"), &permissions)?;
+        create_directory(config_dir.join("c8y"), &permissions)?;
         create_directory(config_dir.join(".tedge-mapper-c8y"), &permissions)?;
 
         let config = self.context.load_config()?;

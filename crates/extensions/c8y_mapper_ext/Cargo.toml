@@ -12,12 +12,14 @@ repository = { workspace = true }
 [dependencies]
 anyhow = { workspace = true }
 async-trait = { workspace = true }
+bumpalo = "3.9.1"
 c8y_api = { workspace = true }
 c8y_auth_proxy = { workspace = true }
 c8y_http_proxy = { workspace = true }
 camino = { workspace = true }
 clock = { workspace = true }
 json-writer = { workspace = true }
+jsonata = "0"
 mime = { workspace = true }
 plugin_sm = { workspace = true }
 serde = { workspace = true }

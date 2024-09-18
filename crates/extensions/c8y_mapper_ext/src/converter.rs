@@ -1265,8 +1265,18 @@ impl CumulocityConverter {
                 self.parse_c8y_smartrest_topics(message).await
             }
             _ => {
-                error!("Unsupported topic: {}", message.topic.name);
-                Ok(vec![])
+                if self
+                    .config
+                    .dynamic_mapper
+                    .subscription_topics()
+                    .accept(message)
+                {
+                    let messages = self.config.dynamic_mapper.convert(message)?;
+                    Ok(messages)
+                } else {
+                    error!("Unsupported topic: {}", message.topic.name);
+                    Ok(vec![])
+                }
             }
         }?;
 
@@ -1519,6 +1529,7 @@ pub(crate) mod tests {
     use crate::actor::IdUploadRequest;
     use crate::actor::IdUploadResult;
     use crate::config::C8yMapperConfig;
+    use crate::dynamic_converter::DynamicMapper;
     use crate::Capabilities;
     use anyhow::Result;
     use assert_json_diff::assert_json_include;
@@ -3124,6 +3135,7 @@ pub(crate) mod tests {
             true,
             AutoLogUpload::Never,
             false,
+            DynamicMapper::try_new(vec![]).unwrap(),
         )
     }
 

@@ -12,6 +12,8 @@ use tedge_mqtt_ext::MqttError;
 use tedge_utils::file::FileError;
 use tedge_utils::size_threshold::SizeThresholdExceededError;
 
+use crate::dynamic_converter::DynamicMapperError;
+
 // allowing enum_variant_names due to a False positive where it is
 // detected that "all variants have the same prefix: `From`"
 #[allow(clippy::enum_variant_names)]
@@ -134,6 +136,9 @@ pub enum ConversionError {
 
     #[error(transparent)]
     ChannelError(#[from] tedge_actors::ChannelError),
+
+    #[error(transparent)]
+    DynamicMapperError(#[from] DynamicMapperError),
 }
 
 #[derive(thiserror::Error, Debug)]
