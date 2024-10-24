@@ -1,11 +1,9 @@
 use crate::actor::C8YHttpProxyActor;
 use crate::actor::C8YHttpProxyMessageBox;
-use crate::credentials::JwtResult;
-use crate::credentials::JwtRetriever;
+use crate::credentials::HttpHeaderResult;
+use crate::credentials::HttpHeaderRetriever;
 use crate::messages::C8YRestRequest;
 use crate::messages::C8YRestResult;
-use certificate::CloudRootCerts;
-use reqwest::Identity;
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -19,6 +17,7 @@ use tedge_actors::RuntimeRequestSink;
 use tedge_actors::ServerMessageBoxBuilder;
 use tedge_actors::Service;
 use tedge_config::ConfigNotSet;
+use tedge_config::MultiError;
 use tedge_config::ReadError;
 use tedge_config::TEdgeConfig;
 use tedge_http_ext::HttpRequest;
@@ -28,6 +27,8 @@ mod actor;
 pub mod credentials;
 pub mod handle;
 pub mod messages;
+
+pub use http::HeaderMap;
 
 #[cfg(test)]
 mod tests;
@@ -39,21 +40,28 @@ pub struct C8YHttpConfig {
     pub c8y_mqtt_host: String,
     pub device_id: String,
     pub tmp_dir: PathBuf,
-    identity: Option<Identity>,
-    cloud_root_certs: CloudRootCerts,
     retry_interval: Duration,
 }
 
-impl TryFrom<&TEdgeConfig> for C8YHttpConfig {
-    type Error = C8yHttpConfigBuildError;
-
-    fn try_from(tedge_config: &TEdgeConfig) -> Result<Self, Self::Error> {
-        let c8y_http_host = tedge_config.c8y.http.or_config_not_set()?.to_string();
-        let c8y_mqtt_host = tedge_config.c8y.mqtt.or_config_not_set()?.to_string();
+impl C8YHttpConfig {
+    pub fn try_new(
+        tedge_config: &TEdgeConfig,
+        c8y_profile: Option<&str>,
+    ) -> Result<Self, C8yHttpConfigBuildError> {
+        let c8y_http_host = tedge_config
+            .c8y
+            .try_get(c8y_profile)?
+            .http
+            .or_config_not_set()?
+            .to_string();
+        let c8y_mqtt_host = tedge_config
+            .c8y
+            .try_get(c8y_profile)?
+            .mqtt
+            .or_config_not_set()?
+            .to_string();
         let device_id = tedge_config.device.id.try_read(tedge_config)?.to_string();
         let tmp_dir = tedge_config.tmp.path.as_std_path().to_path_buf();
-        let identity = tedge_config.http.client.auth.identity()?;
-        let cloud_root_certs = tedge_config.cloud_root_certs();
         let retry_interval = Duration::from_secs(5);
 
         Ok(Self {
@@ -61,8 +69,6 @@ impl TryFrom<&TEdgeConfig> for C8YHttpConfig {
             c8y_mqtt_host,
             device_id,
             tmp_dir,
-            identity,
-            cloud_root_certs,
             retry_interval,
         })
     }
@@ -76,6 +82,9 @@ pub enum C8yHttpConfigBuildError {
 
     #[error(transparent)]
     FromConfigNotSet(#[from] ConfigNotSet),
+
+    #[error(transparent)]
+    FromMultiError(#[from] MultiError),
 
     #[error(transparent)]
     Other(#[from] anyhow::Error),
@@ -92,24 +101,24 @@ pub struct C8YHttpProxyBuilder {
     /// Connection to an HTTP actor
     http: ClientMessageBox<HttpRequest, HttpResult>,
 
-    /// Connection to a JWT token retriever
-    jwt: JwtRetriever,
+    /// Connection to an HTTP header value retriever
+    header_retriever: HttpHeaderRetriever,
 }
 
 impl C8YHttpProxyBuilder {
     pub fn new(
         config: C8YHttpConfig,
         http: &mut impl Service<HttpRequest, HttpResult>,
-        jwt: &mut impl Service<(), JwtResult>,
+        header_retriever: &mut impl Service<(), HttpHeaderResult>,
     ) -> Self {
         let clients = ServerMessageBoxBuilder::new("C8Y-REST", 10);
         let http = ClientMessageBox::new(http);
-        let jwt = JwtRetriever::new(jwt);
+        let header_retriever = HttpHeaderRetriever::new(header_retriever);
         C8YHttpProxyBuilder {
             config,
             clients,
             http,
-            jwt,
+            header_retriever,
         }
     }
 }
@@ -125,7 +134,7 @@ impl Builder<C8YHttpProxyActor> for C8YHttpProxyBuilder {
         let message_box = C8YHttpProxyMessageBox {
             clients: self.clients.build(),
             http: self.http,
-            jwt: self.jwt,
+            header_retriever: self.header_retriever,
         };
 
         C8YHttpProxyActor::new(self.config, message_box)

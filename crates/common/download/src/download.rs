@@ -11,6 +11,7 @@ use log::warn;
 use nix::sys::statvfs;
 pub use partial_response::InvalidResponseError;
 use reqwest::header;
+use reqwest::header::HeaderMap;
 use reqwest::Client;
 use reqwest::Identity;
 use serde::Deserialize;
@@ -20,19 +21,17 @@ use std::fs::File;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
-#[cfg(target_os = "linux")]
-use std::os::unix::prelude::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
-use tedge_utils::file::move_file;
 use tedge_utils::file::FileError;
-use tedge_utils::file::PermissionEntry;
 
 #[cfg(target_os = "linux")]
 use nix::fcntl::fallocate;
 #[cfg(target_os = "linux")]
 use nix::fcntl::FallocateFlags;
+#[cfg(target_os = "linux")]
+use std::os::unix::prelude::AsRawFd;
 
 fn default_backoff() -> ExponentialBackoff {
     // Default retry is an exponential retry with a limit of 15 minutes total.
@@ -51,8 +50,8 @@ fn default_backoff() -> ExponentialBackoff {
 #[serde(deny_unknown_fields)]
 pub struct DownloadInfo {
     pub url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth: Option<Auth>,
+    #[serde(skip)]
+    pub headers: HeaderMap,
 }
 
 impl From<&str> for DownloadInfo {
@@ -66,14 +65,14 @@ impl DownloadInfo {
     pub fn new(url: &str) -> Self {
         Self {
             url: url.into(),
-            auth: None,
+            headers: HeaderMap::new(),
         }
     }
 
     /// Creates new [`DownloadInfo`] from a URL with authentication.
-    pub fn with_auth(self, auth: Auth) -> Self {
+    pub fn with_headers(self, header_map: HeaderMap) -> Self {
         Self {
-            auth: Some(auth),
+            headers: header_map,
             ..self
         }
     }
@@ -87,26 +86,10 @@ impl DownloadInfo {
     }
 }
 
-/// Possible authentication schemes
-#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[serde(deny_unknown_fields)]
-pub enum Auth {
-    /// HTTP Bearer authentication
-    Bearer(String),
-}
-
-impl Auth {
-    pub fn new_bearer(token: &str) -> Self {
-        Self::Bearer(token.into())
-    }
-}
-
 /// A struct which manages file downloads.
 #[derive(Debug)]
 pub struct Downloader {
     target_filename: PathBuf,
-    target_permission: PermissionEntry,
     backoff: ExponentialBackoff,
     client: Client,
 }
@@ -126,28 +109,6 @@ impl Downloader {
         let client = client_builder.build().expect("Client builder is valid");
         Self {
             target_filename: target_path,
-            target_permission: PermissionEntry::default(),
-            backoff: default_backoff(),
-            client,
-        }
-    }
-
-    /// Creates a new downloader which downloads to a target directory and sets
-    /// specified permissions the downloaded file.
-    pub fn with_permission(
-        target_path: PathBuf,
-        target_permission: PermissionEntry,
-        identity: Option<Identity>,
-        cloud_root_certs: CloudRootCerts,
-    ) -> Self {
-        let mut client_builder = cloud_root_certs.client_builder();
-        if let Some(identity) = identity {
-            client_builder = client_builder.identity(identity);
-        }
-        let client = client_builder.build().expect("Client builder is valid");
-        Self {
-            target_filename: target_path,
-            target_permission,
             backoff: default_backoff(),
             client,
         }
@@ -175,8 +136,13 @@ impl Downloader {
         let tmp_target_path = self.temp_filename().await?;
         let target_file_path = self.target_filename.as_path();
 
-        let mut file: File = File::create(&tmp_target_path)
-            .context(format!("Can't create a temporary file {tmp_target_path:?}"))?;
+        let temp_dir = self
+            .target_filename
+            .parent()
+            .unwrap_or(&self.target_filename);
+
+        let mut file = tempfile::NamedTempFile::new_in(temp_dir)
+            .context("Could not write to temporary file".to_string())?;
 
         let mut response = self.request_range_from(url, 0).await?;
 
@@ -187,21 +153,21 @@ impl Downloader {
         );
 
         if file_len > 0 {
-            try_pre_allocate_space(&file, &tmp_target_path, file_len)?;
+            try_pre_allocate_space(file.as_file(), &tmp_target_path, file_len)?;
             debug!("preallocated space for file {tmp_target_path:?}, len={file_len}");
         }
 
-        if let Err(err) = save_chunks_to_file_at(&mut response, &mut file, 0).await {
+        if let Err(err) = save_chunks_to_file_at(&mut response, file.as_file_mut(), 0).await {
             match err {
                 SaveChunksError::Network(err) => {
                     warn!("Error while downloading response: {err}.\nRetrying...");
 
                     match response.headers().get(header::ACCEPT_RANGES) {
                         Some(unit) if unit == "bytes" => {
-                            self.download_remaining(url, &mut file).await?;
+                            self.download_remaining(url, file.as_file_mut()).await?;
                         }
                         _ => {
-                            self.retry(url, &mut file).await?;
+                            self.retry(url, file.as_file_mut()).await?;
                         }
                     }
                 }
@@ -219,13 +185,10 @@ impl Downloader {
             "Moving downloaded file from {:?} to {:?}",
             &tmp_target_path, &target_file_path
         );
-        move_file(
-            tmp_target_path,
-            target_file_path,
-            self.target_permission.clone(),
-        )
-        .await
-        .map_err(FileError::from)?;
+
+        file.persist(target_file_path)
+            .map_err(|p| p.error)
+            .context("Could not persist temporary file".to_string())?;
 
         Ok(())
     }
@@ -407,9 +370,7 @@ impl Downloader {
 
         let operation = || async {
             let mut request = self.client.get(url.url());
-            if let Some(Auth::Bearer(token)) = &url.auth {
-                request = request.bearer_auth(token)
-            }
+            request = request.headers(url.headers.clone());
 
             if range_start != 0 {
                 request = request.header("Range", format!("bytes={range_start}-"));
@@ -505,6 +466,7 @@ fn try_pre_allocate_space(file: &File, path: &Path, file_len: u64) -> Result<(),
 #[allow(deprecated)]
 mod tests {
     use super::*;
+    use hyper::header::AUTHORIZATION;
     use std::io::Write;
     use tempfile::tempdir;
     use tempfile::NamedTempFile;
@@ -740,6 +702,30 @@ mod tests {
         assert_eq!("".as_bytes(), std::fs::read(downloader.filename()).unwrap());
     }
 
+    #[tokio::test]
+    async fn doesnt_leave_tmpfiles_on_errors() {
+        let server = mockito::Server::new();
+
+        let target_dir_path = TempDir::new().unwrap();
+        let target_path = target_dir_path.path().join("test_doesnt_leave_tmpfiles");
+
+        let mut target_url = server.url();
+        target_url.push_str("/some_file.txt");
+
+        let url = DownloadInfo::new(&target_url);
+
+        let mut downloader = Downloader::new(target_path, None, CloudRootCerts::from([]));
+        downloader.set_backoff(ExponentialBackoff {
+            current_interval: Duration::ZERO,
+            max_interval: Duration::ZERO,
+            max_elapsed_time: Some(Duration::ZERO),
+            ..Default::default()
+        });
+        downloader.download(&url).await.unwrap_err();
+
+        assert_eq!(fs::read_dir(target_dir_path.path()).unwrap().count(), 0);
+    }
+
     /// This test simulates HTTP response where a connection just drops and a
     /// client hits a timeout, having downloaded only part of the response.
     ///
@@ -922,10 +908,12 @@ mod tests {
             }
         };
 
-        // applying token if `with_token` = true
+        // applying http auth header
         let url = {
             if with_token {
-                url.with_auth(Auth::Bearer(String::from("token")))
+                let mut headers = HeaderMap::new();
+                headers.append(AUTHORIZATION, "Bearer token".parse().unwrap());
+                url.with_headers(headers)
             } else {
                 url
             }

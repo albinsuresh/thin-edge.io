@@ -5,10 +5,12 @@ use mqtt_channel::PubChannel;
 use mqtt_channel::StreamExt;
 use mqtt_channel::Topic;
 use mqtt_channel::TopicFilter;
+use reqwest::header::HeaderMap;
 use reqwest::Url;
 use std::collections::HashMap;
 use std::time::Duration;
 use tedge_config::mqtt_config::MqttConfigBuildError;
+use tedge_config::MultiError;
 use tedge_config::TEdgeConfig;
 use tedge_config::TopicPrefix;
 use tracing::error;
@@ -26,7 +28,7 @@ pub struct C8yEndPoint {
     c8y_host: String,
     c8y_mqtt_host: String,
     pub device_id: String,
-    pub token: Option<String>,
+    pub headers: HeaderMap,
     devices_internal_id: HashMap<String, String>,
 }
 
@@ -36,7 +38,7 @@ impl C8yEndPoint {
             c8y_host: c8y_host.into(),
             c8y_mqtt_host: c8y_mqtt_host.into(),
             device_id: device_id.into(),
-            token: None,
+            headers: HeaderMap::new(),
             devices_internal_id: HashMap::new(),
         }
     }
@@ -134,13 +136,31 @@ pub struct C8yMqttJwtTokenRetriever {
     topic_prefix: TopicPrefix,
 }
 
+#[derive(thiserror::Error, Debug)]
+pub enum JwtRetrieverError {
+    #[error(transparent)]
+    MqttConfigBuild(#[from] MqttConfigBuildError),
+    #[error(transparent)]
+    ConfigMulti(#[from] MultiError),
+}
+
 impl C8yMqttJwtTokenRetriever {
-    pub fn from_tedge_config(tedge_config: &TEdgeConfig) -> Result<Self, MqttConfigBuildError> {
-        let mqtt_config = tedge_config.mqtt_config()?;
+    pub fn from_tedge_config(
+        tedge_config: &TEdgeConfig,
+        c8y_profile: Option<&str>,
+    ) -> Result<Self, JwtRetrieverError> {
+        let mqtt_config = tedge_config
+            .mqtt_config()
+            .map_err(MqttConfigBuildError::from)?;
 
         Ok(Self::new(
             mqtt_config,
-            tedge_config.c8y.bridge.topic_prefix.clone(),
+            tedge_config
+                .c8y
+                .try_get(c8y_profile)?
+                .bridge
+                .topic_prefix
+                .clone(),
         ))
     }
 

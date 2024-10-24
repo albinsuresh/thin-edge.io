@@ -30,7 +30,7 @@ The Raspberry PI is a relatively simple and cheap device but powerful. Therefore
 ##  Prerequisite
 
 To follow this guide, you only need the following:
-- A [Cumulocity IoT](https://www.softwareag.cloud/site/product/cumulocity-iot.html) Trial tenant.
+- A [Cumulocity IoT](https://cumulocity.com/pages/free-trial/) Trial tenant.
 
 - A Raspberry Pi (any model is fine) with RaspberryPi OS installed, for other boards and OS'es have a look [here](../references/supported-platforms.md)
 - Updated device
@@ -38,6 +38,8 @@ To follow this guide, you only need the following:
     ```
     sudo apt-get update && sudo apt-get upgrade
     ```
+
+- A network which allows communication to the [following ports](../references/supported-platforms.md#network_configuration) for each cloud URL that you plan on using
 
 ## Steps
 

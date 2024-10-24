@@ -1,20 +1,18 @@
-use std::convert::Infallible;
-use std::net::IpAddr;
-
 use axum::async_trait;
-use c8y_http_proxy::credentials::C8YJwtRetriever;
-use c8y_http_proxy::credentials::JwtRetriever;
+use c8y_http_proxy::credentials::HttpHeaderResult;
+use c8y_http_proxy::credentials::HttpHeaderRetriever;
 use camino::Utf8PathBuf;
 use futures::channel::mpsc;
 use futures::StreamExt;
+use std::convert::Infallible;
+use std::net::IpAddr;
 use tedge_actors::Actor;
 use tedge_actors::Builder;
 use tedge_actors::DynSender;
 use tedge_actors::RuntimeError;
 use tedge_actors::RuntimeRequest;
 use tedge_actors::RuntimeRequestSink;
-use tedge_actors::Sequential;
-use tedge_actors::ServerActorBuilder;
+use tedge_actors::Service;
 use tedge_config::TEdgeConfig;
 use tedge_config_macros::OptionalConfig;
 use tracing::info;
@@ -39,20 +37,22 @@ pub struct C8yAuthProxyBuilder {
 impl C8yAuthProxyBuilder {
     pub fn try_from_config(
         config: &TEdgeConfig,
-        jwt: &mut ServerActorBuilder<C8YJwtRetriever, Sequential>,
+        c8y_profile: Option<&str>,
+        header_retriever: &mut impl Service<(), HttpHeaderResult>,
     ) -> anyhow::Result<Self> {
         let reqwest_client = config.cloud_root_certs().client();
+        let c8y = config.c8y.try_get(c8y_profile)?;
         let app_data = AppData {
             is_https: true,
-            host: config.c8y.http.or_config_not_set()?.to_string(),
-            token_manager: TokenManager::new(JwtRetriever::new(jwt)).shared(),
+            host: c8y.http.or_config_not_set()?.to_string(),
+            token_manager: TokenManager::new(HttpHeaderRetriever::new(header_retriever)).shared(),
             client: reqwest_client,
         };
-        let bind = &config.c8y.proxy.bind;
+        let bind = &c8y.proxy.bind;
         let (signal_sender, signal_receiver) = mpsc::channel(10);
-        let cert_path = config.c8y.proxy.cert_path.clone();
-        let key_path = config.c8y.proxy.key_path.clone();
-        let ca_path = config.c8y.proxy.ca_path.clone();
+        let cert_path = c8y.proxy.cert_path.clone();
+        let key_path = c8y.proxy.key_path.clone();
+        let ca_path = c8y.proxy.ca_path.clone();
 
         Ok(Self {
             app_data,
