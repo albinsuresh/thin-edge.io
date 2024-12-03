@@ -3,6 +3,8 @@
 
 use anyhow::Context;
 use cap::Cap;
+use clap::error::ErrorFormatter;
+use clap::error::RichFormatter;
 use clap::Parser;
 use std::alloc;
 use std::future::Future;
@@ -32,14 +34,14 @@ fn main() -> anyhow::Result<()> {
     let opt = parse_multicall_if_known(&executable_name);
     match opt {
         TEdgeOptMulticall::Component(Component::TedgeMapper(opt)) => {
-            let tedge_config = tedge_config::TEdgeConfig::load(&opt.config_dir)?;
+            let tedge_config = tedge_config::TEdgeConfig::load(&opt.common.config_dir)?;
             block_on_with(
                 tedge_config.run.log_memory_interval.duration(),
                 tedge_mapper::run(opt),
             )
         }
         TEdgeOptMulticall::Component(Component::TedgeAgent(opt)) => {
-            let tedge_config = tedge_config::TEdgeConfig::load(&opt.config_dir)?;
+            let tedge_config = tedge_config::TEdgeConfig::load(&opt.common.config_dir)?;
             block_on_with(
                 tedge_config.run.log_memory_interval.duration(),
                 tedge_agent::run(opt),
@@ -56,21 +58,17 @@ fn main() -> anyhow::Result<()> {
             block_on(tedge_watchdog::run(opt))
         }
         TEdgeOptMulticall::Component(Component::TedgeWrite(opt)) => tedge_write::bin::run(opt),
-        TEdgeOptMulticall::Tedge {
-            cmd,
-            config_dir,
-            log_args,
-        } => {
+        TEdgeOptMulticall::Tedge { cmd, common } => {
             let tedge_config_location =
-                tedge_config::TEdgeConfigLocation::from_custom_root(&config_dir);
+                tedge_config::TEdgeConfigLocation::from_custom_root(&common.config_dir);
 
             log_init(
                 "tedge",
-                &log_args,
+                &common.log_args,
                 &tedge_config_location.tedge_config_root_path,
             )?;
 
-            let build_context = BuildContext::new(config_dir);
+            let build_context = BuildContext::new(common.config_dir);
             let cmd = cmd
                 .build_command(build_context)
                 .with_context(|| "missing configuration parameter")?;
@@ -129,5 +127,13 @@ fn parse_multicall_if_known<T: Parser>(executable_name: &Option<String>) -> T {
         .as_deref()
         .map_or(false, |name| cmd.find_subcommand(name).is_some());
     let cmd = cmd.multicall(is_known_subcommand);
-    T::from_arg_matches(&cmd.get_matches()).expect("get_matches panics if invalid arguments are provided, so we won't have arg matches to convert")
+
+    let cmd2 = cmd.clone();
+    match T::from_arg_matches(&cmd.get_matches()) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{}", RichFormatter::format_error(&e.with_cmd(&cmd2)));
+            std::process::exit(1);
+        }
+    }
 }

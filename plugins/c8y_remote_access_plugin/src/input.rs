@@ -6,9 +6,7 @@ use miette::Context;
 use serde::Deserialize;
 use std::io::stdin;
 use std::io::BufRead;
-use std::path::PathBuf;
-use tedge_config::get_config_dir;
-use tedge_config::system_services::LogConfigArgs;
+use tedge_config::cli::CommonArgs;
 use tedge_config::Path;
 use tedge_config::ProfileName;
 use tedge_config::TEdgeConfigLocation;
@@ -33,18 +31,6 @@ about = clap::crate_description!(),
 arg_required_else_help(true),
 )]
 pub struct C8yRemoteAccessPluginOpt {
-    /// [env: TEDGE_CONFIG_DIR, default: /etc/tedge]
-    #[clap(
-        long = "config-dir",
-        default_value = get_config_dir().into_os_string(),
-        hide_env_values = true,
-        hide_default_value = true,
-    )]
-    config_dir: PathBuf,
-
-    #[command(flatten)]
-    pub log_args: LogConfigArgs,
-
     #[arg(long)]
     /// Complete the installation of c8y-remote-access-plugin by declaring the supported operation.
     init: bool,
@@ -75,11 +61,14 @@ pub struct C8yRemoteAccessPluginOpt {
     #[arg(long, env = "C8Y_PROFILE", hide = true)]
     /// The c8y profile to use
     pub profile: Option<ProfileName>,
+
+    #[command(flatten)]
+    pub common: CommonArgs,
 }
 
 impl C8yRemoteAccessPluginOpt {
     pub fn get_config_location(&self) -> TEdgeConfigLocation {
-        TEdgeConfigLocation::from_custom_root(&self.config_dir)
+        TEdgeConfigLocation::from_custom_root(&self.common.config_dir)
     }
 }
 
@@ -89,7 +78,7 @@ pub enum Command {
     Cleanup,
     SpawnChild(String),
     TryConnectUnixSocket(String),
-    Connect(RemoteAccessConnect),
+    Connect((RemoteAccessConnect, Option<ProfileName>)),
 }
 
 pub fn parse_arguments(cli: C8yRemoteAccessPluginOpt) -> miette::Result<Command> {
@@ -130,14 +119,25 @@ impl TryFrom<C8yRemoteAccessPluginOpt> for Command {
 }
 
 impl RemoteAccessConnect {
-    fn deserialize_smartrest(message: &str, mut stdin: impl BufRead) -> miette::Result<Self> {
+    fn deserialize_smartrest(
+        message: &str,
+        mut stdin: impl BufRead,
+    ) -> miette::Result<(Self, Option<ProfileName>)> {
         // Read value from stdin
-        let message = if message.eq("-") {
-            let mut line = String::new();
-            stdin.read_line(&mut line).unwrap();
-            line
+        let (c8y_profile, message) = if message.eq("-") {
+            let mut c8y_profile = None;
+            let mut command = String::new();
+            stdin.read_line(&mut command).unwrap();
+
+            // If it's a smartrest message, it contains a ','
+            if !command.contains(",") {
+                c8y_profile = Some(command.trim().parse().expect("Parsing profile name"));
+                command.clear();
+                stdin.read_line(&mut command).unwrap();
+            }
+            (c8y_profile, command)
         } else {
-            message.to_string()
+            (None, message.to_string())
         };
 
         let (id, command): (u16, Self) = deserialize_csv_record(message.as_str())
@@ -146,7 +146,7 @@ impl RemoteAccessConnect {
             id == 530,
             "SmartREST message is not a RemoteAccessConnect operation"
         );
-        Ok(command)
+        Ok((command, c8y_profile))
     }
 
     pub fn target_address(&self) -> String {
@@ -225,7 +225,39 @@ mod tests {
 
         assert_eq!(
             RemoteAccessConnect::deserialize_smartrest(input, Cursor::new("")).unwrap(),
-            expected
+            (expected, None)
+        );
+    }
+
+    #[test]
+    fn parses_profile_from_a_530_message() {
+        let input = "profile\n530,jrh-rc-test0,127.0.0.1,22,cd8fc847-f4f2-4712-8dd7-31496aef0a7d";
+        let expected = RemoteAccessConnect {
+            device_id: "jrh-rc-test0".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            key: "cd8fc847-f4f2-4712-8dd7-31496aef0a7d".into(),
+        };
+
+        assert_eq!(
+            RemoteAccessConnect::deserialize_smartrest("-", Cursor::new(input)).unwrap(),
+            (expected, Some("profile".parse().unwrap()))
+        );
+    }
+
+    #[test]
+    fn ignores_profile_if_none_exists() {
+        let input = "530,jrh-rc-test0,127.0.0.1,22,cd8fc847-f4f2-4712-8dd7-31496aef0a7d";
+        let expected = RemoteAccessConnect {
+            device_id: "jrh-rc-test0".into(),
+            host: "127.0.0.1".into(),
+            port: 22,
+            key: "cd8fc847-f4f2-4712-8dd7-31496aef0a7d".into(),
+        };
+
+        assert_eq!(
+            RemoteAccessConnect::deserialize_smartrest("-", Cursor::new(input)).unwrap(),
+            (expected, None)
         );
     }
 
@@ -242,7 +274,7 @@ mod tests {
 
         let command = RemoteAccessConnect::deserialize_smartrest(input, Cursor::new("")).unwrap();
 
-        assert_eq!(command.target_address(), "127.0.0.1:22");
+        assert_eq!(command.0.target_address(), "127.0.0.1:22");
     }
 
     #[test]
@@ -257,7 +289,7 @@ mod tests {
 
         assert_eq!(
             RemoteAccessConnect::deserialize_smartrest("-", Cursor::new(input)).unwrap(),
-            expected
+            (expected, None)
         );
     }
 }
