@@ -1,4 +1,4 @@
-use c8y_api::smartrest::error::OperationsError;
+use crate::supported_operations::OperationsError;
 use c8y_api::smartrest::error::SMCumulocityMapperError;
 use c8y_api::smartrest::error::SmartRestDeserializerError;
 use c8y_api::smartrest::error::SmartRestSerializerError;
@@ -82,9 +82,6 @@ pub enum ConversionError {
 
     #[error(transparent)]
     FromSmartRestDeserializerError(#[from] c8y_api::smartrest::error::SmartRestDeserializerError),
-
-    #[error("Unsupported topic: {0}")]
-    UnsupportedTopic(String),
 
     #[error(transparent)]
     FromSerdeJson(#[from] serde_json::Error),
