@@ -1,180 +1,29 @@
-use crate::json_c8y_deserializer::C8yDeviceControlTopic;
-use crate::smartrest::error::OperationsError;
-use crate::smartrest::smartrest_serializer::declare_supported_operations;
-use mqtt_channel::TopicFilter;
+//! Reading and parsing of C8y Supported Operation definition files and field substitution.
+
+use super::C8yPrefix;
+use super::Operations;
+use super::OperationsError;
+use tedge_api::substitution::Record;
+
 use serde::Deserialize;
 use serde::Deserializer;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Duration;
-use tedge_api::substitution::Record;
-use tedge_config::TopicPrefix;
 use tracing::error;
 use tracing::warn;
 
-use super::payload::SmartrestPayload;
-
 const DEFAULT_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(3600);
 const DEFAULT_FORCEFUL_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Operations are derived by reading files subdirectories per cloud /etc/tedge/operations directory
-/// Each operation is a file name in one of the subdirectories
-/// The file name is the operation name
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct Operations {
-    operations: Vec<Operation>,
-    templates: Vec<Operation>,
-}
-
-impl Operations {
-    pub fn add_operation(&mut self, operation: Operation) {
-        self.operations.push(operation);
-        // as we insert, we need to maintain order, because depending on if `Operations` is created
-        // by adding operations one by one or by directory scan, we can end up with a different order
-        // TODO: refactor to provide more sane API, potentially using a backing `BTreeMap`
-        self.operations
-            .sort_unstable_by(|o1, o2| o1.name.cmp(&o2.name));
-    }
-
-    pub fn remove_operation(&mut self, name: &str) -> Option<Operation> {
-        self.operations.dedup();
-        let pos = self.operations.iter().position(|op| op.name == name);
-        pos.map(|pos| self.operations.remove(pos))
-    }
-
-    /// Loads operations defined in the operations directory.
-    ///
-    /// Invalid operation files are ignored and logged.
-    pub fn try_new(
-        dir: impl AsRef<Path>,
-        bridge_config: &impl Record,
-    ) -> Result<Self, OperationsError> {
-        get_operations(dir.as_ref(), bridge_config)
-    }
-
-    pub fn add_template(&mut self, template: Operation) {
-        self.templates.push(template);
-    }
-
-    pub fn get_operations_list(&self) -> Vec<String> {
-        let mut ops_name: Vec<String> = Vec::default();
-        for op in &self.operations {
-            ops_name.push(op.name.clone());
-        }
-
-        ops_name
-    }
-
-    pub fn matching_smartrest_template(&self, operation_template: &str) -> Option<Operation> {
-        for op in self.operations.clone() {
-            if let Some(template) = op.template() {
-                if template.eq(operation_template) {
-                    return Some(op);
-                }
-            }
-        }
-        None
-    }
-
-    pub fn filter_by_topic(
-        &self,
-        topic_name: &str,
-        prefix: &TopicPrefix,
-    ) -> Vec<(String, Operation)> {
-        let mut vec: Vec<(String, Operation)> = Vec::new();
-        for op in self.operations.iter() {
-            match (op.topic(), op.on_fragment()) {
-                (None, Some(on_fragment)) if C8yDeviceControlTopic::name(prefix) == topic_name => {
-                    vec.push((on_fragment, op.clone()))
-                }
-                (Some(topic), Some(on_fragment)) if topic == topic_name => {
-                    vec.push((on_fragment, op.clone()))
-                }
-                _ => {}
-            }
-        }
-        vec
-    }
-
-    pub fn topics_for_operations(&self) -> HashSet<String> {
-        self.operations
-            .iter()
-            .filter_map(|operation| operation.topic())
-            .collect::<HashSet<String>>()
-    }
-
-    pub fn create_smartrest_ops_message(&self) -> SmartrestPayload {
-        let mut ops = self.get_operations_list();
-        ops.sort();
-        let ops = ops.iter().map(|op| op.as_str()).collect::<Vec<_>>();
-        declare_supported_operations(&ops)
-    }
-
-    pub fn get_json_custom_operation_topics(&self) -> Result<TopicFilter, OperationsError> {
-        Ok(self
-            .operations
-            .iter()
-            .filter(|operation| operation.on_fragment().is_some())
-            .filter_map(|operation| operation.topic())
-            .collect::<HashSet<String>>()
-            .try_into()?)
-    }
-
-    pub fn get_smartrest_custom_operation_topics(&self) -> Result<TopicFilter, OperationsError> {
-        Ok(self
-            .operations
-            .iter()
-            .filter(|operation| operation.on_message().is_some())
-            .filter_map(|operation| operation.topic())
-            .collect::<HashSet<String>>()
-            .try_into()?)
-    }
-
-    /// Return operation name if `workflow.operation` matches
-    pub fn get_operation_name_by_workflow_operation(&self, command_name: &str) -> Option<String> {
-        let matching_templates: Vec<&Operation> = self
-            .templates
-            .iter()
-            .filter(|template| {
-                template
-                    .workflow_operation()
-                    .is_some_and(|operation| operation.eq(command_name))
-            })
-            .collect();
-
-        if matching_templates.len() > 1 {
-            warn!(
-                "Found more than one template with the same `workflow.operation` field. Picking {}",
-                matching_templates.first().unwrap().name
-            );
-        }
-
-        matching_templates
-            .first()
-            .and_then(|template| template.on_fragment())
-    }
-
-    pub fn get_template_name_by_operation_name(&self, operation_name: &str) -> Option<&str> {
-        self.templates
-            .iter()
-            .find(|template| {
-                template
-                    .on_fragment()
-                    .is_some_and(|name| name.eq(operation_name))
-            })
-            .map(|template| template.name.as_ref())
-    }
-}
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub struct Operation {
     #[serde(skip)]
     pub name: String,
-    exec: Option<OnMessageExec>,
+    pub(super) exec: Option<OnMessageExec>,
 }
 
 impl Operation {
@@ -352,9 +201,9 @@ struct ExecWorkflow {
     input: Option<serde_json::Value>,
 }
 
-fn get_operations(
+pub fn get_operations<C: Record + C8yPrefix>(
     dir: impl AsRef<Path>,
-    bridge_config: &impl Record,
+    bridge_config: &C,
 ) -> Result<Operations, OperationsError> {
     let mut operations = Operations::default();
     let dir_entries = fs::read_dir(&dir)
@@ -390,7 +239,9 @@ fn get_operations(
 
             if details.is_valid_operation_handler() || details.is_supported_operation_file() {
                 match path.extension() {
-                    None => operations.add_operation(details),
+                    None => {
+                        operations.insert_operation(details);
+                    }
                     Some(extension) if extension.eq("template") => operations.add_template(details),
                     Some(_) => {
                         return Err(OperationsError::InvalidOperationName(path.to_owned()));
@@ -403,9 +254,9 @@ fn get_operations(
     Ok(operations)
 }
 
-pub fn get_child_ops(
+pub fn get_child_ops<C: Record + C8yPrefix>(
     ops_dir: impl AsRef<Path>,
-    bridge_config: &impl Record,
+    bridge_config: &C,
 ) -> Result<HashMap<String, Operations>, OperationsError> {
     let mut child_ops: HashMap<String, Operations> = HashMap::new();
     let child_entries = fs::read_dir(&ops_dir)
@@ -428,10 +279,11 @@ pub fn get_child_ops(
     Ok(child_ops)
 }
 
-pub fn get_operation(
+pub fn get_operation<C: Record + C8yPrefix>(
     path: &Path,
-    bridge_config: &impl Record,
+    bridge_config: &C,
 ) -> Result<Operation, OperationsError> {
+    let c8y_prefix = bridge_config.c8y_prefix();
     let text = fs::read_to_string(path)?;
     let mut details = toml::from_str::<Operation>(&text)
         .map_err(|e| OperationsError::TomlError(path.to_path_buf(), e))?;
@@ -443,7 +295,10 @@ pub fn get_operation(
 
     if let Some(ref mut exec) = details.exec {
         if let Some(ref topic) = exec.topic {
-            exec.topic = Some(bridge_config.inject_values_into_template(topic))
+            let mut templated_topic = bridge_config.inject_values_into_template(topic);
+            // TODO is this robust?
+            templated_topic = templated_topic.replace("c8y/", &format!("{c8y_prefix}/"));
+            exec.topic = Some(templated_topic)
         }
     }
 
@@ -504,10 +359,9 @@ pub enum InvalidCustomOperationHandler {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::str::FromStr;
-
     use super::*;
+
+    use std::io::Write;
     use tedge_config::TopicPrefix;
     use test_case::test_case;
 
@@ -585,15 +439,6 @@ mod tests {
         }
     }
 
-    impl Operation {
-        fn new(exec: OnMessageExec) -> Self {
-            Self {
-                name: "name".to_string(),
-                exec: Some(exec),
-            }
-        }
-    }
-
     struct TestBridgeConfig {
         c8y_prefix: TopicPrefix,
     }
@@ -604,6 +449,12 @@ mod tests {
                 ".bridge.c8y_prefix" => Some(self.c8y_prefix.as_str().into()),
                 _ => None,
             }
+        }
+    }
+
+    impl C8yPrefix for TestBridgeConfig {
+        fn c8y_prefix(&self) -> &TopicPrefix {
+            &self.c8y_prefix
         }
     }
 
@@ -696,7 +547,10 @@ mod tests {
     )]
     fn valid_custom_operation_handlers(toml: &str) {
         let exec: OnMessageExec = toml::from_str(toml).unwrap();
-        let operation = Operation::new(exec);
+        let operation = Operation {
+            name: "operation".to_string(),
+            exec: Some(exec),
+        };
         assert!(operation.is_valid_operation_handler());
     }
 
@@ -727,45 +581,10 @@ mod tests {
     )]
     fn invalid_custom_operation_handlers(toml: &str) {
         let exec: OnMessageExec = toml::from_str(toml).unwrap();
-        let operation = Operation::new(exec);
-        assert!(!operation.is_valid_operation_handler());
-    }
-
-    #[test_case(
-        r#"
-        on_fragment = "c8y_Something"
-        command = "echo 1"
-        "#,
-        r#"
-        topic = "c8y/custom/one"
-        on_fragment = "c8y_Something"
-        command = "echo 2" 
-        "#
-    )]
-    fn filter_by_topic_(toml1: &str, toml2: &str) {
-        let exec: OnMessageExec = toml::from_str(toml1).unwrap();
-        let operation1 = Operation::new(exec);
-
-        let exec: OnMessageExec = toml::from_str(toml2).unwrap();
-        let operation2 = Operation::new(exec);
-
-        let ops = Operations {
-            operations: vec![operation1.clone(), operation2.clone()],
-            ..Default::default()
+        let operation = Operation {
+            name: "operation".to_string(),
+            exec: Some(exec),
         };
-
-        let prefix = TopicPrefix::from_str("c8y").unwrap();
-
-        let filter_custom = ops.filter_by_topic("c8y/custom/one", &prefix);
-        assert_eq!(
-            filter_custom,
-            vec![("c8y_Something".to_string(), operation2)]
-        );
-
-        let filter_default = ops.filter_by_topic("c8y/devicecontrol/notifications", &prefix);
-        assert_eq!(
-            filter_default,
-            vec![("c8y_Something".to_string(), operation1)]
-        );
+        assert!(!operation.is_valid_operation_handler());
     }
 }

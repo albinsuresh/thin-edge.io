@@ -127,8 +127,15 @@ impl TEdgeComponent for CumulocityMapper {
                 local_prefix.clone(),
                 "",
             )?;
+            tc.forward_from_local(
+                "measurement/measurements/createBulk/#",
+                local_prefix.clone(),
+                "",
+            )?;
             tc.forward_from_local("event/events/create/#", local_prefix.clone(), "")?;
+            tc.forward_from_local("event/events/createBulk/#", local_prefix.clone(), "")?;
             tc.forward_from_local("alarm/alarms/create/#", local_prefix.clone(), "")?;
+            tc.forward_from_local("alarm/alarms/createBulk/#", local_prefix.clone(), "")?;
 
             // JWT token
             if use_certificate {
@@ -137,7 +144,7 @@ impl TEdgeComponent for CumulocityMapper {
 
             let c8y = c8y_config.mqtt.or_config_not_set()?;
             let mut cloud_config = tedge_mqtt_bridge::MqttOptions::new(
-                tedge_config.device.id.try_read(&tedge_config)?,
+                c8y_config.device.id()?,
                 c8y.host().to_string(),
                 c8y.port().into(),
             );
@@ -146,7 +153,7 @@ impl TEdgeComponent for CumulocityMapper {
             cloud_config.set_clean_session(true);
 
             if use_certificate {
-                use_key_and_cert(&mut cloud_config, &c8y_config.root_cert_path, &tedge_config)?;
+                use_key_and_cert(&mut cloud_config, c8y_config)?;
             } else {
                 let (username, password) = read_c8y_credentials(&c8y_config.credentials_path)?;
                 use_credentials(
@@ -157,8 +164,7 @@ impl TEdgeComponent for CumulocityMapper {
                 )?;
             }
 
-            let main_device_xid: EntityExternalId =
-                tedge_config.device.id.try_read(&tedge_config)?.into();
+            let main_device_xid: EntityExternalId = c8y_config.device.id()?.into();
             let service_type = &tedge_config.service.ty;
             let service_type = if service_type.is_empty() {
                 "service".to_string()
@@ -298,7 +304,7 @@ pub fn service_monitor_client_config(
     c8y_profile: Option<&str>,
 ) -> Result<Config, anyhow::Error> {
     let c8y_config = tedge_config.c8y.try_get(c8y_profile)?;
-    let main_device_xid: EntityExternalId = tedge_config.device.id.try_read(tedge_config)?.into();
+    let main_device_xid: EntityExternalId = c8y_config.device.id()?.into();
     let service_type = &tedge_config.service.ty;
     let service_type = if service_type.is_empty() {
         "service".to_string()
