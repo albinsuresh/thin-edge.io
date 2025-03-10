@@ -53,7 +53,7 @@ install-tools:
     rustup component add rls rust-analysis rust-src rustfmt clippy
     rustup toolchain install nightly
     rustup component add rustfmt --toolchain nightly
-    cargo install taplo-cli cargo-nextest
+    cargo +stable install taplo-cli cargo-nextest
 
 # Check if necessary tools are installed
 [private]
@@ -96,7 +96,7 @@ format-check: check-tools
     fi
     cd tests/RobotFramework
     source .venv/bin/activate
-    invoke check-format-tests
+    invoke lint-tests
 
 # Check code
 check TARGET=DEFAULT_TARGET:
