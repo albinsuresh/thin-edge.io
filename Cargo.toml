@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "1.5.1"
+version = "1.6.0"
 authors = ["thin-edge.io team <info@thin-edge.io>"]
 edition = "2021"
 rust-version = "1.78"
@@ -137,6 +137,7 @@ mime = "0.3.17"
 mime_guess = "2.0.4"
 mockall = "0.11"
 mockito = "1.1.0"
+mqttbytes = "0.6"
 mutants = "0.0.3"
 nanoid = "0.4"
 nix = "0.26"
@@ -158,7 +159,7 @@ quote = "1"
 rand = "0.8"
 rasn = "0.18" # Not using the latest version which requires rust 1.85
 rasn-cms = "0.18" # Not using the latest version which requires rust 1.85
-rcgen = { version = "0.12", features = ["pem", "zeroize"] }
+rcgen = { version = "0.14", features = ["pem", "zeroize"] }
 regex = "1.4"
 reqwest = { version = "0.12", default-features = false }
 ron = "0.8"
