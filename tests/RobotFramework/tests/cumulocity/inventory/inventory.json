@@ -1,6 +1,7 @@
 {
     "name": "TST_dark_knight",
     "type": "RPi5",
+    "manufacturer": "Broadcom",
     "customData": {
         "mode": "ACTIVE",
         "version": 1,

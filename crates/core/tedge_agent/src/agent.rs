@@ -2,6 +2,7 @@ use crate::device_profile_manager::DeviceProfileManagerBuilder;
 use crate::entity_manager;
 use crate::entity_manager::server::EntityStoreRequest;
 use crate::entity_manager::server::EntityStoreServer;
+use crate::entity_manager::server::EntityStoreServerConfig;
 use crate::http_server::actor::HttpServerBuilder;
 use crate::http_server::actor::HttpServerConfig;
 use crate::operation_file_cache::FileCacheActorBuilder;
@@ -27,6 +28,7 @@ use reqwest::Identity;
 use std::fmt::Debug;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tedge_actors::Concurrent;
 use tedge_actors::ConvertingActor;
 use tedge_actors::ConvertingActorBuilder;
@@ -63,6 +65,7 @@ use tedge_script_ext::ScriptActor;
 use tedge_signal_ext::SignalActor;
 use tedge_uploader_ext::UploaderActor;
 use tedge_utils::file::create_directory_with_defaults;
+use tracing::error;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
@@ -372,7 +375,7 @@ impl Agent {
             let tedge_to_te_converter = create_tedge_to_te_converter(&mut mqtt_actor_builder)?;
             runtime.spawn(tedge_to_te_converter).await?;
 
-            let state_dir = agent_state_dir(self.config.state_dir, self.config.config_dir);
+            let state_dir = agent_state_dir(self.config.state_dir, self.config.config_dir.clone());
             let clean_start = self.config.entity_store_clean_start;
             let telemetry_cache_size = 0; // Agent need not cache any data messages, the mapper would
 
@@ -384,11 +387,15 @@ impl Agent {
                 state_dir,
                 clean_start,
             )?;
-            let entity_store_server = EntityStoreServer::new(
-                entity_store,
+            let entity_store_server_config = EntityStoreServerConfig::new(
+                self.config.config_dir.into_std_path_buf(),
                 mqtt_schema.clone(),
-                &mut mqtt_actor_builder,
                 self.config.entity_auto_register,
+            );
+            let entity_store_server = EntityStoreServer::new(
+                entity_store_server_config,
+                entity_store,
+                &mut mqtt_actor_builder,
             );
             let mut entity_store_actor_builder =
                 ServerActorBuilder::new(entity_store_server, &ServerConfig::default(), Sequential);
@@ -402,6 +409,24 @@ impl Agent {
                     })
                 },
             );
+            let mut init_sender = entity_store_actor_builder.get_sender();
+            tokio::spawn(async move {
+                // Allow the entity store to complete its initialization
+                // after giving it some time to process all the retained metadata messages on startup
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                if let Err(err) = init_sender
+                    .send(RequestEnvelope {
+                        request: EntityStoreRequest::InitComplete,
+                        reply_to: Box::new(NullSender),
+                    })
+                    .await
+                {
+                    error!(
+                        "Failed to send init complete message to entity store: {}",
+                        err
+                    );
+                }
+            });
 
             let file_transfer_server_builder = HttpServerBuilder::try_bind(
                 self.config.http_config,
