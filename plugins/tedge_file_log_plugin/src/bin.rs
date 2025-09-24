@@ -1,7 +1,9 @@
 use crate::FileLogPlugin;
 use crate::LogPluginConfig;
 use camino::Utf8Path;
-use camino::Utf8PathBuf;
+use std::fs::File;
+use std::io::BufRead;
+use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 use tedge_config::cli::CommonArgs;
@@ -32,9 +34,6 @@ pub enum PluginOp {
     Get {
         /// Log type to retrieve
         log_type: String,
-
-        /// Target log file path
-        output_file_path: Utf8PathBuf,
 
         /// Filter logs from this date onwards
         #[clap(long = "since")]
@@ -86,9 +85,11 @@ pub fn run(cli: FileLogCli, plugin_config: TEdgeConfigView) -> anyhow::Result<()
     match cli.operation {
         PluginOp::List => match plugin.list(None) {
             Ok(types) => {
+                println!(":::begin-tedge:::");
                 for log_type in types {
                     println!("{}", log_type);
                 }
+                println!(":::end-tedge:::");
                 Ok(())
             }
             Err(err) => {
@@ -98,7 +99,6 @@ pub fn run(cli: FileLogCli, plugin_config: TEdgeConfigView) -> anyhow::Result<()
         },
         PluginOp::Get {
             log_type,
-            output_file_path,
             since,
             until,
             filter,
@@ -109,7 +109,7 @@ pub fn run(cli: FileLogCli, plugin_config: TEdgeConfigView) -> anyhow::Result<()
                     Ok(date) => Some(date),
                     Err(err) => {
                         log::error!("Invalid since date: {err}");
-                        return Err(err.into());
+                        return Err(err);
                     }
                 }
             } else {
@@ -121,23 +121,24 @@ pub fn run(cli: FileLogCli, plugin_config: TEdgeConfigView) -> anyhow::Result<()
                     Ok(date) => Some(date),
                     Err(err) => {
                         log::error!("Invalid until date: {err}");
-                        return Err(err.into());
+                        return Err(err);
                     }
                 }
             } else {
                 None
             };
 
-            match plugin.get(
-                &log_type,
-                &output_file_path,
-                since_date,
-                until_date,
-                filter.as_deref(),
-                tail,
-            ) {
-                Ok(_) => {
-                    println!("Logs written to {}", output_file_path);
+            match plugin.get(&log_type, since_date, until_date, filter.as_deref(), tail) {
+                Ok(log_path) => {
+                    let src = File::open(&log_path)?;
+                    let reader = BufReader::new(src);
+
+                    println!(":::begin-tedge:::");
+                    for line in reader.lines() {
+                        let line = line?;
+                        println!("{}", line);
+                    }
+                    println!(":::end-tedge:::");
                     Ok(())
                 }
                 Err(err) => {
@@ -149,6 +150,7 @@ pub fn run(cli: FileLogCli, plugin_config: TEdgeConfigView) -> anyhow::Result<()
     }
 }
 
-fn parse_date(date_str: &str) -> Result<OffsetDateTime, time::error::Parse> {
-    OffsetDateTime::parse(date_str, &time::format_description::well_known::Rfc3339)
+fn parse_date(date_str: &str) -> anyhow::Result<OffsetDateTime> {
+    let timestamp = date_str.parse::<i64>()?;
+    Ok(OffsetDateTime::from_unix_timestamp(timestamp)?)
 }

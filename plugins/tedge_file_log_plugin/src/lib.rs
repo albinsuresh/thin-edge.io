@@ -9,6 +9,7 @@ pub use error::*;
 pub use log_utils::*;
 
 use camino::Utf8Path;
+use camino::Utf8PathBuf;
 use std::sync::Arc;
 use tedge_api::CommandLog;
 use time::OffsetDateTime;
@@ -34,12 +35,11 @@ impl FileLogPlugin {
     fn get(
         &self,
         log_type: &str,
-        output_file_path: &Utf8Path,
         since: Option<OffsetDateTime>,
         _until: Option<OffsetDateTime>,
         filter_text: Option<&str>,
         lines: Option<usize>,
-    ) -> Result<(), LogManagementError> {
+    ) -> Result<Utf8PathBuf, LogManagementError> {
         // Use the existing file-based log retrieval logic
         let date_from = since.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let lines = lines.unwrap_or(1000);
@@ -54,14 +54,6 @@ impl FileLogPlugin {
             &self.tmp_dir,
         )?;
 
-        // Copy the generated log file to the requested temp file path
-        std::fs::copy(&log_path, output_file_path)?;
-
-        // Clean up the temporary file
-        if let Err(e) = std::fs::remove_file(&log_path) {
-            log::warn!("Failed to remove temporary file {}: {}", log_path, e);
-        }
-
-        Ok(())
+        Ok(log_path)
     }
 }

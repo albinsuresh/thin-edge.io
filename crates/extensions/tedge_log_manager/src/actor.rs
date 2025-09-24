@@ -165,18 +165,17 @@ impl LogManagerActor {
             .unwrap_or((&request_payload.log_type, "file"));
 
         let log_path = if let Some(plugin) = self.external_plugins.by_plugin_type(plugin_name) {
-            let temp_log_file = self.config.tmp_dir.join(format!(
+            let output_log_path = self.config.tmp_dir.join(format!(
                 "{}_{}_{}.log",
                 log_type,
                 plugin_name,
                 OffsetDateTime::now_utc().unix_timestamp()
             ));
-            warn!("Retrieving log to temp file: {:?}", temp_log_file.as_path());
 
             plugin
                 .get(
                     log_type,
-                    temp_log_file.as_path(),
+                    output_log_path.as_path(),
                     Some(request_payload.date_from),
                     Some(request_payload.date_to),
                     request_payload.search_text.as_deref(),
@@ -184,7 +183,7 @@ impl LogManagerActor {
                 )
                 .await?;
 
-            temp_log_file.to_path_buf()
+            output_log_path.to_path_buf()
         } else {
             return Err(LogManagementError::PluginError {
                 plugin_name: plugin_name.to_string(),
