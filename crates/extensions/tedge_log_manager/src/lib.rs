@@ -4,8 +4,8 @@ mod error;
 mod plugin;
 mod plugin_manager;
 
-// #[cfg(test)]
-// mod tests;
+#[cfg(test)]
+mod tests;
 
 use crate::plugin_manager::ExternalPlugins;
 pub use actor::*;

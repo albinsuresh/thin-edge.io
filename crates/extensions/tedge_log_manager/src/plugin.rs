@@ -156,7 +156,7 @@ impl Plugin for ExternalPluginCommand {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(self.plugin_error(format!("Get command failed with {}", stderr)));
+            return Err(self.plugin_error(format!("Get command error: {}", stderr)));
         }
 
         let stdout = String::from_utf8_lossy(&output.stdout);

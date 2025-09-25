@@ -257,7 +257,7 @@ impl LogManagerActor {
         if path.parent() == Some(&self.config.plugins_dir)
             || path
                 .file_name()
-                .map_or(false, |name| name.eq(DEFAULT_PLUGIN_CONFIG_FILE_NAME))
+                .is_some_and(|name| name.eq(DEFAULT_PLUGIN_CONFIG_FILE_NAME))
         {
             self.reload_supported_log_types().await?;
         }
