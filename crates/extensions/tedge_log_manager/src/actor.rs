@@ -69,8 +69,6 @@ impl Actor for LogManagerActor {
     }
 
     async fn run(mut self) -> Result<(), RuntimeError> {
-        self.external_plugins.load().await?;
-
         self.reload_supported_log_types().await?;
 
         while let Some(event) = self.messages.recv().await {
@@ -242,7 +240,7 @@ impl LogManagerActor {
         Ok(())
     }
 
-    async fn process_file_watch_events(&mut self, event: FsWatchEvent) -> Result<(), ChannelError> {
+    async fn process_file_watch_events(&mut self, event: FsWatchEvent) -> Result<(), RuntimeError> {
         let path = match event {
             FsWatchEvent::Modified(path) => path,
             FsWatchEvent::FileDeleted(path) => path,
@@ -256,28 +254,26 @@ impl LogManagerActor {
             FsWatchEvent::DirectoryCreated(_) => return Ok(()),
         };
 
-        match path.file_name() {
-            Some(path) if path.eq(DEFAULT_PLUGIN_CONFIG_FILE_NAME) => {
-                self.reload_supported_log_types().await?;
-                Ok(())
-            }
-            Some(_) => Ok(()),
-            None => {
-                error!(
-                    "Path for {} does not exist",
-                    DEFAULT_PLUGIN_CONFIG_FILE_NAME
-                );
-                Ok(())
-            }
+        if path.parent() == Some(&self.config.plugins_dir)
+            || path
+                .file_name()
+                .map_or(false, |name| name.eq(DEFAULT_PLUGIN_CONFIG_FILE_NAME))
+        {
+            self.reload_supported_log_types().await?;
         }
+
+        Ok(())
     }
 
-    async fn reload_supported_log_types(&mut self) -> Result<(), ChannelError> {
+    async fn reload_supported_log_types(&mut self) -> Result<(), RuntimeError> {
         info!("Reloading supported log types");
 
         // Note: The log manager now only handles external plugins.
         // The file-based plugin configuration is handled by the standalone plugin.
-        self.publish_supported_log_types().await
+        self.external_plugins.load().await?;
+        self.publish_supported_log_types().await?;
+
+        Ok(())
     }
 
     /// updates the log types
