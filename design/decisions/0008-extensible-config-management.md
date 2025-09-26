@@ -34,11 +34,18 @@ like the pre-update or post-update actions, leaving the rest of the behavior unc
   - `list`: list all the log types that it supports.
     Used to detect if this is a valid plugin if it exits with exit code 0.
     The output is used only when auto-discovery for log types is turned ON for this plugin.
-  - `get <type> <temp-log-file-path> [--since <timestamp>] [--until <timestamp>] [--filter <filter-text>] [--tail <lines-from-end>]`:
+  - `get <log-type> [--since <timestamp>] [--until <timestamp>] [--filter <filter-text>] [--tail <lines-from-end>]`:
     Used to fetch the log for the given type within the provided log range.
     The log content must be written to the temporary file passed provided by the agent.
-- The plugin directory would also have a `conf.d` directory where each plugin can store their configuration in a toml file.
-  These config files are used to turn type discovery on/off and to define inclusion/exclusion list when type discovery is turned on:
+- Factory plugins maintained by tedge (e.g: `file` plugin) are installed at `/usr/lib/tedge/log-plugins` and
+  user provided plugins can be installed at `/usr/local/lib/tedge/log-plugins`.
+- These plugins are executed by the agent with `sudo` and hence the following sudoers entry is created by the agent by default:
+  `tedge    ALL = (ALL) NOPASSWD:SETENV: /usr/local/lib/tedge/log-plugins/[a-zA-Z0-9]*"`
+- The configuration file for the agent's log manager remains at `/etc/tedge/plugins/tedge-log-plugin.toml`.
+  The `files` entries in it would be used by the `file` plugin.
+- In addition to the `files` entries, this config file can be used to control
+  if all the types listed by the plugins must be reported as supported types or not (auto-discovery),
+  or apply additional filtering in the listed types using `include` and `exclude` entries as follows:
   ```journald.toml
   [plugins.journald]
   auto_discover=true
@@ -55,13 +62,13 @@ like the pre-update or post-update actions, leaving the rest of the behavior unc
 - The `auto_discover` and `include`/`exclude` configs are used by the `tedge-agent`
   to process the supported types listed by that plugin.
   Any plugin-specific settings can also be defined in these files, which are ignored by the agent,
-  but can be used by the plugin.
-- The main config file for a plugin must be named after the plugin itself (e,g: `docker.sh` -> `docker.toml`).
-  Key configs like `auto_discover` can only be defined in this main file.
-  The inclusion/exclusion list can be defined in extension files as well,
-  but the table names with the plugin name prefix (e.g: `[docker.include]` and `[docker.exclude]`) must be used in those as well.
-- When new software is installed, their corresponding `include/exclude` entries can be appended to the main plugin config itself,
-  or created in an independent extension file.
+  but can be used by the plugin itself.
+- In addition to the main `tedge-log-plugin.toml` config file,
+  extensions to it can be created in `/etc/tedge/plugins/log-plugin.d` as drop-ins.
+  Agent is watching this directory for any config additions/removals.  
+- When new software is installed, this drop-in functionality can be used to get its log types registered with the agent,
+  either by just touching this directory when `auto_discover` for its corresponding plugin is enabled,
+  or by explicitly adding their `include` entry in a config extension file.
 
 The agent uses the plugins as follows:
 
