@@ -40,7 +40,6 @@ impl FileLogPlugin {
         filter_text: Option<&str>,
         lines: Option<usize>,
     ) -> Result<Utf8PathBuf, LogManagementError> {
-        // Use the existing file-based log retrieval logic
         let date_from = since.unwrap_or(OffsetDateTime::UNIX_EPOCH);
         let lines = lines.unwrap_or(1000);
         let search_text = filter_text.map(|s| s.to_string());
