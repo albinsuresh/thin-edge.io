@@ -142,7 +142,7 @@ where
         match AptCli::try_parse() {
             Ok(apt) => return TEdgeOptMulticall::Component(Component::TedgeAptPlugin(apt)),
             Err(e) => {
-                eprintln!("{}", RichFormatter::format_error(&e));
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
@@ -157,7 +157,7 @@ where
         match FileLogCli::try_parse() {
             Ok(cli) => return TEdgeOptMulticall::Component(Component::TedgeFileLogPlugin(cli)),
             Err(e) => {
-                eprintln!("{}", RichFormatter::format_error(&e));
+                eprintln!("{e}");
                 std::process::exit(1);
             }
         }
