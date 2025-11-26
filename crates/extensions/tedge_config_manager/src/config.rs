@@ -1,4 +1,5 @@
 use camino::Utf8Path;
+use camino::Utf8PathBuf;
 use log::error;
 use log::info;
 use log::warn;
@@ -24,6 +25,7 @@ use tedge_utils::file::PermissionEntry;
 
 use super::error::InvalidConfigTypeError;
 
+pub const DEFAULT_PLUGIN_DIR: &str = "config-plugins";
 pub const DEFAULT_PLUGIN_CONFIG_FILE_NAME: &str = "tedge-configuration-plugin.toml";
 pub const DEFAULT_OPERATION_DIR_NAME: &str = "plugins/";
 pub const DEFAULT_PLUGIN_CONFIG_TYPE: &str = "tedge-configuration-plugin";
@@ -32,6 +34,7 @@ pub const DEFAULT_PLUGIN_CONFIG_TYPE: &str = "tedge-configuration-plugin";
 #[derive(Clone, Debug)]
 pub struct ConfigManagerConfig {
     pub config_dir: PathBuf,
+    pub plugin_dirs: Vec<Utf8PathBuf>,
     pub plugin_config_dir: PathBuf,
     pub plugin_config_path: PathBuf,
     pub tmp_path: Arc<Utf8Path>,
@@ -54,6 +57,7 @@ pub struct ConfigManagerOptions {
     pub tmp_path: Arc<Utf8Path>,
     pub is_sudo_enabled: bool,
     pub config_update_enabled: bool,
+    pub plugin_dirs: Vec<Utf8PathBuf>,
 }
 
 impl ConfigManagerConfig {
@@ -82,6 +86,7 @@ impl ConfigManagerConfig {
 
         Ok(Self {
             config_dir,
+            plugin_dirs: cliopts.plugin_dirs,
             plugin_config_dir,
             plugin_config_path,
             tmp_path: cliopts.tmp_path,

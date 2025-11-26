@@ -93,6 +93,10 @@ contents:
       mode: 0644
     packager: rpm
 
+  # config plugins directory
+  - dst: /usr/share/tedge/config-plugins
+    type: dir
+
   # preset log plugins
 
   # file
