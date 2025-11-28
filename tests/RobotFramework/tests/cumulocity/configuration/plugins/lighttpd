@@ -29,6 +29,8 @@ get_config() {
 set_config() {
     local config_type="$1"
     local target_config="$2"
+    local config_path="/etc/lighttpd/lighttpd.conf"
+    local backup_path="${config_path}.backup"
 
     if [[ "$config_type" != "lighttpd.conf" ]]; then
         echo "Error: Unsupported config type '$config_type'" >&2
@@ -41,8 +43,27 @@ set_config() {
         exit 1
     fi
 
-    mv "$target_config" /etc/lighttpd/lighttpd.conf
-    systemctl reload lighttpd
+    # Backup existing configuration
+    if [[ -f "$config_path" ]]; then
+        cp "$config_path" "$backup_path"
+    fi
+
+    # Apply new configuration
+    mv "$target_config" "$config_path"
+
+    # Reload service and check if it succeeded
+    if ! systemctl reload lighttpd; then
+        echo "Error: Failed to reload lighttpd service, restoring backup" >&2
+        # Restore from backup
+        if [[ -f "$backup_path" ]]; then
+            mv "$backup_path" "$config_path"
+            systemctl reload lighttpd
+        fi
+        exit 1
+    fi
+
+    # Clean up backup on success
+    rm -f "$backup_path"
 }
 
 main() {
