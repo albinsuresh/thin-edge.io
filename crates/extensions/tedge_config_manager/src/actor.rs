@@ -37,6 +37,7 @@ use tedge_write::CopyOptions;
 use tedge_write::CreateDirsOptions;
 use time::OffsetDateTime;
 
+use crate::plugin::ExternalPlugin;
 use crate::plugin_manager::ExternalPlugins;
 use crate::FileEntry;
 use crate::TedgeWriteStatus;
@@ -235,37 +236,31 @@ impl ConfigManagerWorker {
         topic: &Topic,
         request: &mut ConfigSnapshotCmdPayload,
     ) -> Result<Utf8PathBuf, ConfigManagementError> {
-        let config_path =
-            if let Some((config_type, plugin_name)) = request.config_type.split_once("::") {
-                if let Some(plugin) = self.external_plugins.by_plugin_type(plugin_name) {
-                    let target_file = self.config.tmp_path.join(format!(
-                        "{}_{}_{}.conf",
-                        config_type,
-                        plugin_name,
-                        OffsetDateTime::now_utc().unix_timestamp()
-                    ));
+        let config_path = if let Some(plugin) = self.get_plugin(&request.config_type)? {
+            let (config_type, plugin_name) = split_cloud_config_type(&request.config_type)
+                .expect("get_plugin returned Some, so config_type must have a plugin");
+            let target_file = self.config.tmp_path.join(format!(
+                "{}_{}_{}.conf",
+                config_type,
+                plugin_name,
+                OffsetDateTime::now_utc().unix_timestamp()
+            ));
 
-                    info!(
-                        target: "config plugins",
-                        "Retrieving config type: {} to file: {}", config_type, target_file
-                    );
+            info!(
+                target: "config plugins",
+                "Retrieving config type: {} to file: {}", config_type, target_file
+            );
 
-                    plugin.get(config_type, target_file.as_std_path()).await?;
+            plugin.get(config_type, &target_file).await?;
 
-                    target_file.to_path_buf()
-                } else {
-                    return Err(ConfigManagementError::PluginError {
-                        plugin_name: plugin_name.to_string(),
-                        reason: "Plugin not found".to_string(),
-                    });
-                }
-            } else {
-                // File-based config retrieval
-                let file_entry = self
-                    .plugin_config
-                    .get_file_entry_from_type(&request.config_type)?;
-                Utf8PathBuf::from(&file_entry.path)
-            };
+            target_file.to_path_buf()
+        } else {
+            // No plugin specified; fall back to built-in file-based config handling
+            let file_entry = self
+                .plugin_config
+                .get_file_entry_from_type(&request.config_type)?;
+            Utf8PathBuf::from(&file_entry.path)
+        };
 
         let tedge_url = match &request.tedge_url {
             Some(tedge_url) => tedge_url,
@@ -389,41 +384,35 @@ impl ConfigManagerWorker {
         let from_path = Utf8Path::from_path(&from)
             .with_context(|| format!("path is not utf-8: '{}'", from.to_string_lossy()))?;
 
-        let config_path =
-            if let Some((config_type, plugin_name)) = request.config_type.split_once("::") {
-                if let Some(plugin) = self.external_plugins.by_plugin_type(plugin_name) {
-                    info!(
-                        target: "config plugins",
-                        "Setting config type: {} from file: {}", config_type, from_path
-                    );
+        let config_path = if let Some(plugin) = self.get_plugin(&request.config_type)? {
+            let (config_type, _) = split_cloud_config_type(&request.config_type)
+                .expect("get_plugin returned Some, so config_type must have a plugin");
+            info!(
+                target: "config plugins",
+                "Setting config type: {} from file: {}", config_type, from_path
+            );
 
-                    plugin.set(config_type, from_path.as_std_path()).await?;
+            plugin.set(config_type, from_path).await?;
 
-                    None
-                } else {
-                    return Err(ConfigManagementError::PluginError {
-                        plugin_name: plugin_name.to_string(),
-                        reason: "Plugin not found".to_string(),
-                    });
+            None
+        } else {
+            // No plugin specified; fall back to legacy file-based config handling
+            let file_entry = self
+                .plugin_config
+                .get_file_entry_from_type(&request.config_type)?;
+            let to = Utf8PathBuf::from(&file_entry.path);
+
+            if let Some(parent) = to.parent() {
+                if !parent.exists() {
+                    self.create_parent_dirs(parent, file_entry)?;
                 }
-            } else {
-                // File-based config update
-                let file_entry = self
-                    .plugin_config
-                    .get_file_entry_from_type(&request.config_type)?;
-                let to = Utf8PathBuf::from(&file_entry.path);
+            }
 
-                if let Some(parent) = to.parent() {
-                    if !parent.exists() {
-                        self.create_parent_dirs(parent, file_entry)?;
-                    }
-                }
-
-                let deployed_to_path = self
-                    .deploy_config_file(from_path, file_entry)
-                    .context("failed to deploy configuration file")?;
-                Some(deployed_to_path)
-            };
+            let deployed_to_path = self
+                .deploy_config_file(from_path, file_entry)
+                .context("failed to deploy configuration file")?;
+            Some(deployed_to_path)
+        };
 
         Ok(config_path)
     }
@@ -581,7 +570,7 @@ impl ConfigManagerWorker {
                         );
 
                         for conf_type in conf_types {
-                            config_types.push(format!("{}::{}", conf_type, plugin_type));
+                            config_types.push(build_cloud_config_type(&conf_type, &plugin_type));
                         }
                     }
                     Err(e) => {
@@ -606,6 +595,24 @@ impl ConfigManagerWorker {
         Ok(())
     }
 
+    fn get_plugin(
+        &self,
+        config_type: &str,
+    ) -> Result<Option<&ExternalPlugin>, ConfigManagementError> {
+        if let Some((_, plugin_name)) = split_cloud_config_type(config_type) {
+            if let Some(plugin) = self.external_plugins.by_plugin_type(plugin_name) {
+                Ok(Some(plugin))
+            } else {
+                Err(ConfigManagementError::PluginError {
+                    plugin_name: plugin_name.to_string(),
+                    reason: "Plugin not found".to_string(),
+                })
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
     async fn publish_command_status(
         &mut self,
         operation: ConfigOperation,
@@ -613,6 +620,14 @@ impl ConfigManagerWorker {
         let state = ConfigOperationData::State(operation);
         self.output_sender.send(state).await
     }
+}
+
+fn split_cloud_config_type(config_type: &str) -> Option<(&str, &str)> {
+    config_type.split_once("::")
+}
+
+fn build_cloud_config_type(config_type: &str, plugin_name: &str) -> String {
+    format!("{}::{}", config_type, plugin_name)
 }
 
 #[derive(Debug, PartialEq, Eq, Clone)]

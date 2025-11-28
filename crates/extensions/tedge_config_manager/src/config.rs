@@ -25,7 +25,6 @@ use tedge_utils::file::PermissionEntry;
 
 use super::error::InvalidConfigTypeError;
 
-pub const DEFAULT_PLUGIN_DIR: &str = "config-plugins";
 pub const DEFAULT_PLUGIN_CONFIG_FILE_NAME: &str = "tedge-configuration-plugin.toml";
 pub const DEFAULT_OPERATION_DIR_NAME: &str = "plugins/";
 pub const DEFAULT_PLUGIN_CONFIG_TYPE: &str = "tedge-configuration-plugin";

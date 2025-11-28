@@ -997,8 +997,8 @@ define_tedge_config! {
     },
 
     configuration: {
-        /// The directories where log plugins are stored
-        #[tedge_config(example = "/usr/share/config-plugins,/usr/share/local/config-plugins", default(value = "/usr/share/tedge/config-plugins"))]
+        /// The directories where configuration plugins are stored
+        #[tedge_config(example = "/usr/share/tedge/config-plugins,/usr/local/share/tedge/config-plugins", default(value = "/usr/share/tedge/config-plugins"))]
         plugin_paths: TemplatesSet,
     }
 

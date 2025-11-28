@@ -2,7 +2,6 @@ use crate::error::ConfigManagementError;
 use camino::Utf8Path;
 use std::fs::File;
 use std::io::Write;
-use std::path::Path;
 use std::path::PathBuf;
 use std::process::Output;
 use std::sync::Arc;
@@ -103,7 +102,7 @@ impl ExternalPlugin {
     pub(crate) async fn get(
         &self,
         config_type: &str,
-        target_file_path: &Path,
+        target_file_path: &Utf8Path,
     ) -> Result<(), ConfigManagementError> {
         let mut command = self.command(GET)?;
         command.arg(config_type);
@@ -113,33 +112,25 @@ impl ExternalPlugin {
         let stdout = String::from_utf8_lossy(&output.stdout);
         let file = File::create(target_file_path).map_err(|err| {
             self.plugin_error(format!(
-                "Failed to create plugin output file at {} due to {}",
-                target_file_path.display(),
-                err
+                "Failed to create plugin output file at {target_file_path} due to {err}",
             ))
         })?;
         let mut writer = std::io::BufWriter::new(&file);
 
         write!(writer, "{}", stdout).map_err(|err| {
             self.plugin_error(format!(
-                "Failed to write plugin output to {} due to {}",
-                target_file_path.display(),
-                err
+                "Failed to write plugin output to {target_file_path} due to {err}",
             ))
         })?;
 
         writer.flush().map_err(|err| {
             self.plugin_error(format!(
-                "Failed to flush plugin output to {} due to {}",
-                target_file_path.display(),
-                err
+                "Failed to flush plugin output to {target_file_path} due to {err}",
             ))
         })?;
         file.sync_all().map_err(|err| {
             self.plugin_error(format!(
-                "Failed to sync plugin output to {} due to {}",
-                target_file_path.display(),
-                err
+                "Failed to sync plugin output to {target_file_path} due to {err}",
             ))
         })?;
 
@@ -149,7 +140,7 @@ impl ExternalPlugin {
     pub(crate) async fn set(
         &self,
         config_type: &str,
-        config_file_path: &Path,
+        config_file_path: &Utf8Path,
     ) -> Result<(), ConfigManagementError> {
         let mut command = self.command(SET)?;
         command.arg(config_type);

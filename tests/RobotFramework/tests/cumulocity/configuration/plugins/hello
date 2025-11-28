@@ -6,8 +6,8 @@ usage() {
     echo "Usage: $0 <command> [args...]"
     echo "Commands:"
     echo "  list                                    List all config types supported by this plugin"
-    echo "  get <type> <target-file-path>           Get config for the specified type and write to the target path"
-    echo "  set <type> <new-config-path>            Set config for the specified type with the new config path"
+    echo "  get <type>                              Print the config for the specified type to stdout"
+    echo "  set <type> <new-config-path>            Update the config for the specified type from the new config path"
     exit 1
 }
 
