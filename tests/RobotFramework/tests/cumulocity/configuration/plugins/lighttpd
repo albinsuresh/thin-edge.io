@@ -12,40 +12,47 @@ usage() {
 }
 
 list_config_types() {
-    echo hello.conf
+    echo lighttpd.conf
 }
 
 get_config() {
     local config_type="$1"
 
-    if [[ "$config_type" != "hello.conf" ]]; then
+    if [[ "$config_type" != "lighttpd.conf" ]]; then
         echo "Error: Unsupported config type '$config_type'" >&2
         exit 1
     fi
 
-    cat /etc/hello.conf
+    cat /etc/lighttpd/lighttpd.conf
 }
 
 set_config() {
     local config_type="$1"
     local target_config="$2"
 
-    if [[ "$config_type" != "hello.conf" ]]; then
+    if [[ "$config_type" != "lighttpd.conf" ]]; then
         echo "Error: Unsupported config type '$config_type'" >&2
         exit 1
     fi
-    mv "$target_config" /etc/hello.conf
-    systemctl restart hello
+
+    # Verify the new configuration before applying it
+    if ! lighttpd -t -f "$target_config" 2>&1; then
+        echo "Error: Configuration validation failed" >&2
+        exit 1
+    fi
+
+    mv "$target_config" /etc/lighttpd/lighttpd.conf
+    systemctl reload lighttpd
 }
 
 main() {
     if [[ $# -lt 1 ]]; then
         usage
     fi
-    
+
     local command="$1"
     shift
-    
+
     case "$command" in
         "list")
             list_config_types

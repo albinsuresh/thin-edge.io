@@ -14,16 +14,26 @@ Test Tags           theme:c8y    theme:log
 
 *** Test Cases ***
 Config operation plugin
-    ${operation}=    Cumulocity.Get Configuration    hello.conf::hello
+    # Get current configuration
+    ${operation}=    Cumulocity.Get Configuration    lighttpd.conf::lighttpd
     Operation Should Be SUCCESSFUL    ${operation}    timeout=10
 
+    # Verify initial server tag
+    ${initial_tag}=    Execute Command
+    ...    curl -I http://localhost 2>/dev/null | grep -i '^Server:'
+    Should Contain    ${initial_tag}    lighttpd
+
+    # Apply new configuration with custom server tag
     ${config_url}=    Cumulocity.Create Inventory Binary
-    ...    hello.conf
-    ...    hello.conf
-    ...    file=${CURDIR}/plugins/hello-v2.conf
-    ${operation}=    Cumulocity.Set Configuration    hello.conf::hello    url=${config_url}
-    Operation Should Be SUCCESSFUL    ${operation}    timeout=10
-    Execute Command    grep 'Hello mars' /var/log/hello.log
+    ...    lighttpd.conf
+    ...    lighttpd.conf
+    ...    file=${CURDIR}/plugins/lighttpd.conf
+    ${operation}=    Cumulocity.Set Configuration    lighttpd.conf::lighttpd    url=${config_url}
+    Operation Should Be SUCCESSFUL    ${operation}    timeout=30
+
+    # Verify server tag has been updated
+    ${updated_tag}=    Execute Command    curl -I http://localhost 2>/dev/null | grep -i '^Server:'
+    Should Contain    ${updated_tag}    tedge-lighttpd
 
 
 *** Keywords ***
@@ -32,23 +42,15 @@ Custom Setup
     Set Suite Variable    $DEVICE_SN
     Device Should Exist    ${DEVICE_SN}
 
-    ThinEdgeIO.Transfer To Device
-    ...    ${CURDIR}/plugins/hello.sh
-    ...    /usr/local/bin/hello.sh
-    ThinEdgeIO.Transfer To Device
-    ...    ${CURDIR}/plugins/hello.conf
-    ...    /etc/hello.conf
-    ThinEdgeIO.Transfer To Device
-    ...    ${CURDIR}/plugins/hello.service
-    ...    /etc/systemd/system/hello.service
-    Execute Command    chmod +x /usr/local/bin/hello.sh
-    Execute Command    systemctl daemon-reload
-    Execute Command    systemctl enable --now hello.service
+    # Install lighttpd as the test software
+    Execute Command    sudo apt install -y lighttpd
+    Service Should Be Running    lighttpd
 
+    # Install lighttpd config management plugin
     ThinEdgeIO.Transfer To Device
-    ...    ${CURDIR}/plugins/hello
-    ...    /usr/share/tedge/config-plugins/hello
-    Execute Command    chmod +x /usr/share/tedge/config-plugins/hello
+    ...    ${CURDIR}/plugins/lighttpd
+    ...    /usr/share/tedge/config-plugins/lighttpd
+    Execute Command    chmod +x /usr/share/tedge/config-plugins/lighttpd
 
     Restart Service    tedge-agent
     ThinEdgeIO.Service Health Status Should Be Up    tedge-agent
