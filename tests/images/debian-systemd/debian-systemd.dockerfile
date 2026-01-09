@@ -36,6 +36,8 @@ RUN apt-get -y update \
     mosquitto \
     mosquitto-clients
 
+RUN update-alternatives --set vi /usr/bin/vim.tiny
+
 # Note: Avoid using mosquitto 2.0.18 due to a session persistence bug when using `per_listener_settings true
 # Only comment out the custom install logic to make it easier to re-enable once the bug is resolved
 # See https://github.com/thin-edge/thin-edge.io/issues/3185 for more details
