@@ -211,7 +211,7 @@ jobs:
           fetch-depth: 0
 
       # Install nfpm used to for linux packaging
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: false
@@ -495,7 +495,7 @@ jobs:
         with:
           python-version: '3.11'
       # Install nfpm used to for linux packaging
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: false
