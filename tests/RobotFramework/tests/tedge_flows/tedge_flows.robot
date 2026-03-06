@@ -440,6 +440,32 @@ Params are dynamically reloaded
     ...    date_from=${start}
     ...    message_contains=Hello World!
 
+Flow with static mqtt topic loop is rejected at load time
+    Install Flow    infinite-loop-flows    mqtt-static-loop.toml
+    ${errors}    Execute Command
+    ...    tedge flows test te/loop/test '{}'
+    ...    stdout=${False}
+    ...    stderr=${True}
+    Should Contain    ${errors}    infinite loop
+    Should Contain    ${errors}    te/loop/test
+    [Teardown]    Uninstall Flow    mqtt-static-loop.toml
+
+Flow with mqtt runtime loop drops messages
+    Install Flow    infinite-loop-flows    mqtt-runtime-loop.toml
+    ${output}    Execute Command    tedge flows test te/loop/test '{}'    strip=${True}
+    Should Be Empty    ${output}
+    [Teardown]    Uninstall Flow    mqtt-runtime-loop.toml
+
+Flow with static file path loop is rejected at load time
+    Install Flow    infinite-loop-flows    file-loop.toml
+    ${errors}    Execute Command
+    ...    tedge flows test te/anything '{}'
+    ...    stdout=${False}
+    ...    stderr=${True}
+    Should Contain    ${errors}    infinite loop
+    Should Contain    ${errors}    /tmp/tedge-loop-test.txt
+    [Teardown]    Uninstall Flow    file-loop.toml
+
 
 *** Keywords ***
 Custom Setup

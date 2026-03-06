@@ -1,0 +1,11 @@
+# This flow creates a runtime MQTT loop:
+# messages are passed through without a topic change for the output
+name = "mqtt-passthrough-loop"
+
+[input]
+mqtt.topics = ["te/loop/+"]
+
+[[steps]]
+builtin = "add-timestamp"
+
+# No output.mqtt.topic: output messages retain their original topic.

@@ -120,6 +120,16 @@ pub enum ConfigError {
 
     #[error("Not a valid step configuration: {0}")]
     IncorrectSetting(String),
+
+    #[error("Flow '{name}' defines an infinite loop: the output topic '{output_topic}' matches input filter '{input_filter}'")]
+    MqttInfiniteLoop {
+        name: String,
+        input_filter: String,
+        output_topic: String,
+    },
+
+    #[error("Flow '{name}' defines an infinite loop: the output file '{path}' is the same as the input file")]
+    FileInfiniteLoop { name: String, path: String },
 }
 
 impl FlowConfig {
@@ -239,6 +249,10 @@ impl FlowConfig {
         let name = self
             .name
             .unwrap_or_else(|| source.file_name().unwrap_or_default().to_string());
+
+        // Detect static infinite loops before constructing the flow.
+        detect_loop(&name, &input, &output)?;
+
         Ok(Flow {
             name,
             version: self.version,
@@ -429,10 +443,38 @@ fn default_errors() -> OutputConfig {
     }
 }
 
+/// Checks whether `input` and `output` form an infinite loop,
+/// where the output of published to the same input source
+fn detect_loop(name: &str, input: &FlowInput, output: &FlowOutput) -> Result<(), ConfigError> {
+    match (input, output) {
+        (FlowInput::Mqtt { topics }, FlowOutput::Mqtt { topic: Some(out) })
+            if topics.accept_topic_name(&out.name) =>
+        {
+            Err(ConfigError::MqttInfiniteLoop {
+                name: name.to_string(),
+                input_filter: format!("{topics:?}"),
+                output_topic: out.name.clone(),
+            })
+        }
+        (
+            FlowInput::PollFile { path: in_path, .. } | FlowInput::StreamFile { path: in_path, .. },
+            FlowOutput::File { path: out_path },
+        ) if in_path == out_path => Err(ConfigError::FileInfiniteLoop {
+            name: name.to_string(),
+            path: in_path.to_string(),
+        }),
+        _ => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use camino::Utf8PathBuf;
     use serde_json::json;
+    use std::time::Duration;
+    use tedge_mqtt_ext::Topic;
+    use tedge_mqtt_ext::TopicFilter;
 
     #[test]
     fn inherit_shared_config() {
@@ -500,5 +542,46 @@ mod tests {
             };
             assert_eq!(&step.with_interval_as_config().config, merged_config);
         }
+    }
+
+    #[test]
+    fn detect_loop_when_output_topic_matches_input_filter() {
+        let input = FlowInput::Mqtt {
+            topics: TopicFilter::new_unchecked("te/loop/+"),
+        };
+        let output = FlowOutput::Mqtt {
+            topic: Some(Topic::new("te/loop/test").unwrap()),
+        };
+        assert!(matches!(
+            detect_loop("my-flow", &input, &output),
+            Err(ConfigError::MqttInfiniteLoop { .. })
+        ));
+    }
+
+    #[test]
+    fn detect_loop_when_poll_file_output_matches_input_path() {
+        let input = FlowInput::PollFile {
+            topic: "te/loop".to_string(),
+            path: Utf8PathBuf::from("/tmp/data.txt"),
+            interval: Duration::from_secs(1),
+        };
+        let output = FlowOutput::File {
+            path: Utf8PathBuf::from("/tmp/data.txt"),
+        };
+        assert!(matches!(
+            detect_loop("my-flow", &input, &output),
+            Err(ConfigError::FileInfiniteLoop { .. })
+        ));
+    }
+
+    #[test]
+    fn no_loop_detected_when_output_topic_differs_from_input_filter() {
+        let input = FlowInput::Mqtt {
+            topics: TopicFilter::new_unchecked("te/loop/+"),
+        };
+        let output = FlowOutput::Mqtt {
+            topic: Some(Topic::new("te/another/test").unwrap()),
+        };
+        assert!(detect_loop("my-flow", &input, &output).is_ok());
     }
 }
