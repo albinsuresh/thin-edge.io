@@ -12,6 +12,7 @@ use crate::error::MessageConversionError;
 use crate::mea::events::EventConverter;
 use crate::operations;
 use crate::operations::OperationHandler;
+use crate::shell_execute::SHELL_EXECUTE_OPERATION;
 use crate::supported_operations::operation::get_child_ops;
 use crate::supported_operations::operation::Operation;
 use crate::supported_operations::operation::ResultFormat;
@@ -22,10 +23,8 @@ use anyhow::Context;
 use c8y_api::json_c8y::C8yCreateEvent;
 use c8y_api::json_c8y_deserializer::C8yDeviceControlOperation;
 use c8y_api::json_c8y_deserializer::C8yDeviceControlTopic;
-use c8y_api::json_c8y_deserializer::C8yJsonOverMqttDeserializerError;
 use c8y_api::json_c8y_deserializer::C8yOperation;
 use c8y_api::json_c8y_deserializer::C8ySoftwareUpdate;
-use c8y_api::smartrest::error::SmartRestDeserializerError;
 use c8y_api::smartrest::inventory::child_device_creation_message;
 use c8y_api::smartrest::inventory::service_creation_message;
 use c8y_api::smartrest::message::collect_smartrest_messages;
@@ -61,6 +60,7 @@ use tedge_actors::Sender;
 use tedge_api::commands::RestartCommand;
 use tedge_api::commands::SoftwareCommandMetadata;
 use tedge_api::commands::SoftwareListCommand;
+use tedge_api::control::ActionName;
 use tedge_api::entity::EntityExternalId;
 use tedge_api::entity::EntityType;
 use tedge_api::entity_store::EntityRegistrationMessage;
@@ -176,9 +176,17 @@ pub struct CumulocityConverter {
     pub active_commands: HashMap<CmdId, Option<Instant>>,
     pub recently_completed_commands: HashMap<CmdId, Instant>,
     active_commands_last_cleared: Instant,
+    // Keep the software list commands issued by this mapper, until they are cleared,
+    // to avoid requesting a software list while an equivalent request is still pending
+    pending_software_list_requests: HashMap<CmdId, EntityTopicId>,
+    // Targets for which a software list has to be requested, once the pending requests are known.
+    // A capability message can be received before the retained requests issued before a restart.
+    deferred_software_list_requests: HashSet<EntityTopicId>,
 
     pub supported_operations: SupportedOperations,
     pub operation_handler: OperationHandler,
+    // Keep the service actions declared by the services of this device and its children
+    pub(crate) service_actions: HashMap<EntityTopicId, Vec<ActionName>>,
 }
 
 impl CumulocityConverter {
@@ -259,7 +267,10 @@ impl CumulocityConverter {
             active_commands: HashMap::new(),
             recently_completed_commands: HashMap::new(),
             active_commands_last_cleared: Instant::now(),
+            pending_software_list_requests: HashMap::new(),
+            deferred_software_list_requests: HashSet::new(),
             operation_handler,
+            service_actions: HashMap::new(),
         })
     }
 
@@ -282,6 +293,7 @@ impl CumulocityConverter {
         if message.payload().is_empty() {
             // Clear cached entity
             self.entity_cache.delete(&topic_id);
+            self.service_actions.remove(&topic_id);
             return Ok(UpdateOutcome::Deleted);
         }
 
@@ -492,13 +504,17 @@ impl CumulocityConverter {
 
             let result = self
                 .process_json_over_mqtt(
-                    device_xid,
+                    device_xid.clone(),
                     operation.op_id.clone(),
                     &operation.extras,
                     &operation_message,
                 )
                 .await;
-            let result = self.handle_c8y_operation_result(&result, Some(operation.op_id.clone()));
+            let result = self.handle_c8y_operation_result(
+                &result,
+                &device_xid,
+                Some(operation.op_id.clone()),
+            );
             self.active_commands.insert(cmd_id, Some(Instant::now()));
             output.extend(result);
         }
@@ -584,6 +600,14 @@ impl CumulocityConverter {
                     vec![]
                 }
             }
+            C8yDeviceControlOperation::ServiceCommand(request) => {
+                if self.config.capabilities.service_control {
+                    self.convert_control_request(device_xid, cmd_id, request)?
+                } else {
+                    warn!("Received a c8y_ServiceCommand operation, however, service_control feature is disabled");
+                    vec![]
+                }
+            }
             C8yDeviceControlOperation::Custom => {
                 return self
                     .process_json_custom_operation(
@@ -617,13 +641,13 @@ impl CumulocityConverter {
             .process_json_custom_operation(
                 operation.op_id.clone(),
                 cmd_id.clone(),
-                device_xid,
+                device_xid.clone(),
                 &operation.extras,
                 message,
             )
             .await;
 
-        let output = self.handle_c8y_operation_result(&result, Some(operation.op_id));
+        let output = self.handle_c8y_operation_result(&result, &device_xid, Some(operation.op_id));
         self.active_commands.insert(cmd_id, Some(Instant::now()));
 
         Ok(output)
@@ -650,6 +674,10 @@ impl CumulocityConverter {
         for (on_fragment, custom_handler) in &handlers {
             if extras.contains_key(on_fragment) {
                 if let Some(command_name) = custom_handler.workflow_operation() {
+                    if self.is_disabled_command(command_name) {
+                        warn!("Received a {on_fragment} operation, however, the shell_execute feature is disabled");
+                        break;
+                    }
                     return self.convert_custom_operation_request(
                         device_xid,
                         cmd_id,
@@ -716,33 +744,39 @@ impl CumulocityConverter {
         let mut output: Vec<MqttMessage> = Vec::new();
         for smartrest_message in collect_smartrest_messages(message.payload_str()?) {
             let result = self.process_smartrest(smartrest_message.as_str()).await;
-            let mut msgs = self.handle_c8y_operation_result(&result, None);
+            let mut msgs = self.handle_c8y_operation_result(
+                &result,
+                self.entity_cache.main_device_external_id().as_ref(),
+                None,
+            );
             output.append(&mut msgs)
         }
         Ok(output)
     }
 
     fn handle_c8y_operation_result(
-        &mut self,
+        &self,
         result: &Result<Vec<MqttMessage>, CumulocityMapperError>,
+        target_xid: &str,
         op_id: Option<String>,
     ) -> Vec<MqttMessage> {
         match result {
-            Err(
-                err @ CumulocityMapperError::FromSmartRestDeserializer(
-                    SmartRestDeserializerError::InvalidParameter { operation, .. },
-                )
-                | err @ CumulocityMapperError::FromC8yJsonOverMqttDeserializerError(
-                    C8yJsonOverMqttDeserializerError::InvalidParameter { operation, .. },
-                )
-                | err @ CumulocityMapperError::ExecuteFailed {
-                    operation_name: operation,
-                    ..
-                },
-            ) => {
-                let topic = C8yTopic::SmartRestResponse
-                    .to_topic(&self.config.bridge_config.c8y_prefix)
-                    .unwrap();
+            Err(err) => {
+                error!("{err}");
+                let Some(operation) = err.failed_operation_name() else {
+                    return vec![];
+                };
+
+                let prefix = &self.config.bridge_config.c8y_prefix;
+                let topic = if target_xid == self.entity_cache.main_device_external_id().as_ref() {
+                    Ok(C8yTopic::upstream_topic(prefix))
+                } else {
+                    C8yTopic::ChildSmartRestResponse(target_xid.to_string()).to_topic(prefix)
+                };
+                let Ok(topic) = topic else {
+                    error!("Not reporting the failure to Cumulocity: '{target_xid}' names no SmartREST topic");
+                    return vec![];
+                };
 
                 let (payload1, payload2) =
                     if let (Some(op_id), true) = (op_id, self.config.smartrest_use_operation_id) {
@@ -759,12 +793,7 @@ impl CumulocityConverter {
 
                 let msg1 = MqttMessage::new(&topic, payload1);
                 let msg2 = MqttMessage::new(&topic, payload2);
-                error!("{err}");
                 vec![msg1, msg2]
-            }
-            Err(err) => {
-                error!("{err}");
-                vec![]
             }
 
             Ok(msgs) => msgs.to_owned(),
@@ -832,9 +861,29 @@ impl CumulocityConverter {
         Ok(vec![message])
     }
 
-    fn request_software_list(&self, target: &EntityTopicId) -> MqttMessage {
+    pub fn has_deferred_software_list_requests(&self) -> bool {
+        !self.deferred_software_list_requests.is_empty()
+    }
+
+    /// Requests a software list from each target registered for software update,
+    /// unless a request issued by this mapper is still pending for that target
+    pub fn take_software_list_requests(&mut self) -> Vec<MqttMessage> {
+        let mut requests = vec![];
+        for target in std::mem::take(&mut self.deferred_software_list_requests) {
+            if let Some(cmd_id) = self.pending_software_list_request(&target) {
+                info!("Skipping software list request for {target}: command {cmd_id} is still pending");
+                continue;
+            }
+            requests.push(self.request_software_list(&target));
+        }
+        requests
+    }
+
+    fn request_software_list(&mut self, target: &EntityTopicId) -> MqttMessage {
         let cmd_id = self.command_id.new_id();
-        let request = SoftwareListCommand::new(target, cmd_id);
+        let request = SoftwareListCommand::new(target, cmd_id.clone());
+        self.pending_software_list_requests
+            .insert(cmd_id, target.clone());
         request.command_message(&self.mqtt_schema)
     }
 
@@ -1035,6 +1084,15 @@ impl CumulocityConverter {
         self.active_commands.contains_key(cmd_id)
             || self.recently_completed_commands.contains_key(cmd_id)
     }
+
+    /// The id of a software list command issued by this mapper to the given target,
+    /// if any is still pending, i.e. not cleared yet whatever its status
+    fn pending_software_list_request(&self, target: &EntityTopicId) -> Option<&CmdId> {
+        self.pending_software_list_requests
+            .iter()
+            .find(|(_, pending_target)| *pending_target == target)
+            .map(|(cmd_id, _)| cmd_id)
+    }
 }
 
 #[derive(Error, Debug)]
@@ -1126,13 +1184,18 @@ impl CumulocityConverter {
                 self.active_commands.remove(cmd_id);
                 self.recently_completed_commands
                     .insert(cmd_id.to_owned(), Instant::now());
+                self.pending_software_list_requests.remove(cmd_id);
                 Ok(vec![])
             }
 
             Channel::CommandMetadata { operation } => {
+                if entity_type == EntityType::Service && operation == &OperationType::Control {
+                    return self.convert_control_metadata(&source, message).await;
+                }
+
                 // https://github.com/thin-edge/thin-edge.io/issues/2739
                 if message.payload().is_empty() {
-                    warn!(topic = ?message.topic.name, "Ignoring command metadata clearing message: clearing capabilities is not currently supported");
+                    warn!(topic = ?message.topic.name, "Ignoring command metadata clearing message: clearing device capabilities is not currently supported");
                     return Ok(vec![]);
                 }
                 match operation {
@@ -1142,7 +1205,8 @@ impl CumulocityConverter {
                             .await
                     }
                     OperationType::SoftwareUpdate => {
-                        self.register_software_update_operation(&source).await
+                        self.register_software_update_operation(&source, message)
+                            .await
                     }
                     OperationType::LogUpload => self.convert_log_metadata(&source, message).await,
                     OperationType::ConfigSnapshot => {
@@ -1165,11 +1229,17 @@ impl CumulocityConverter {
                 }
             }
 
-            Channel::Command { cmd_id, .. } if self.command_id.is_generator_of(cmd_id) => {
+            Channel::Command { operation, cmd_id } if self.command_id.is_generator_of(cmd_id) => {
                 // Keep track of operation if we've received it through a retain message
                 // If we've already got the operation in `active_commands`, set the insertion
                 // time to `None` to disable the time-based expiry
                 self.active_commands.insert(cmd_id.clone(), None);
+                if *operation == OperationType::SoftwareList {
+                    // A software list request, possibly issued before a restart of the mapper,
+                    // which has to be cleared before a new one is issued to the same target
+                    self.pending_software_list_requests
+                        .insert(cmd_id.clone(), source.clone());
+                }
 
                 let entity = self.entity_cache.try_get(&source)?;
                 let entity = operations::EntityTarget {
@@ -1243,12 +1313,25 @@ impl CumulocityConverter {
             {
                 self.parse_c8y_smartrest_topics(message).await
             }
+            topic
+                if topic.name
+                    == C8yTopic::SmartRestRequest
+                        .with_prefix(&self.config.bridge_config.c8y_prefix) =>
+            {
+                // We receive SmartREST operation notifications regardless of whether any custom
+                // operations are configured to use it. This branch exists to prevent us logging
+                // an error for this message we expect
+                Ok(vec![])
+            }
             topic if self.mapper_config.http_event_topic.accept_topic(topic) => {
                 self.post_event_over_http(message).await?;
                 Ok(vec![])
             }
             _ => {
-                error!("Unsupported topic: {}", message.topic.name);
+                warn!(
+                    "Received message on subscribed topic '{}' but no handler matched.",
+                    message.topic.name
+                );
                 Ok(vec![])
             }
         }?;
@@ -1383,11 +1466,24 @@ impl CumulocityConverter {
         }
     }
 
+    /// The built-in `shell_execute` command is only mapped to Cumulocity
+    /// when the `c8y.enable.shell_execute` feature is enabled
+    fn is_disabled_command(&self, command_name: &str) -> bool {
+        command_name == SHELL_EXECUTE_OPERATION && !self.config.capabilities.shell_execute
+    }
+
     async fn register_custom_operation(
         &mut self,
         target: &EntityTopicId,
         command_name: &str,
     ) -> Result<Vec<MqttMessage>, ConversionError> {
+        if self.is_disabled_command(command_name) {
+            warn!(
+                "Received {command_name} metadata, however, the shell_execute feature is disabled"
+            );
+            return Ok(vec![]);
+        }
+
         if let Some(c8y_op_name) = self
             .supported_operations
             .get_operation_name_by_workflow_operation(command_name)
@@ -1426,6 +1522,7 @@ impl CumulocityConverter {
     async fn register_software_update_operation(
         &mut self,
         target: &EntityTopicId,
+        message: &MqttMessage,
     ) -> Result<Vec<MqttMessage>, ConversionError> {
         if !self.config.capabilities.software_update {
             warn!(
@@ -1441,7 +1538,17 @@ impl CumulocityConverter {
             Ok(messages) => messages,
         };
 
-        registration.push(self.request_software_list(target));
+        if message.retain {
+            self.deferred_software_list_requests.insert(target.clone());
+        } else {
+            // A live capability message is published by an agent that has just (re)started.
+            // The requests pending since before are not reliable anymore:
+            // some might never be completed or cleared, e.g. a cleared request resumed by the agent.
+            self.pending_software_list_requests
+                .retain(|_, pending_target| pending_target != target);
+            self.deferred_software_list_requests.remove(target);
+            registration.push(self.request_software_list(target));
+        }
         Ok(registration)
     }
 }
@@ -1499,7 +1606,7 @@ pub(crate) mod tests {
     use tedge_actors::CloneSender;
     use tedge_actors::LoggingSender;
     use tedge_actors::SimpleMessageBoxBuilder;
-    use tedge_api::file_transfer_url::FileTransferUrls;
+    use tedge_api::http_url::FileTransferUrls;
     use tedge_api::mqtt_topics::default_topic_schema;
     use tedge_api::mqtt_topics::Channel;
     use tedge_api::mqtt_topics::ChannelFilter;
@@ -1510,6 +1617,8 @@ pub(crate) mod tests {
     use tedge_api::pending_entity_store::RegisteredEntityData;
     use tedge_api::script::ShellScript;
     use tedge_api::workflow::log::log_dir::OperationLogs;
+    use tedge_api::CommandStatus;
+    use tedge_api::SoftwareListCommand;
     use tedge_api::SoftwareUpdateCommand;
     use tedge_config::models::AutoLogUpload;
     use tedge_config::models::SoftwareManagementApiFlag;
@@ -2601,6 +2710,248 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn software_list_is_requested_when_software_update_capability_is_received() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        let requests = software_list_requests(&converter, &device, &messages);
+        assert_eq!(
+            requests.len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(requests[0].payload_bytes()).unwrap(),
+            json!({"status": "init"})
+        );
+    }
+
+    #[test_case(CommandStatus::Init)]
+    #[test_case(CommandStatus::Executing)]
+    #[test_case(CommandStatus::Successful)]
+    #[tokio::test]
+    async fn software_list_is_not_requested_while_a_previous_request_is_pending(
+        status: CommandStatus,
+    ) {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        // A software list command issued by this mapper, e.g. before being restarted,
+        // received as a retained message from the broker and not cleared yet
+        let previous_request = SoftwareListCommand::new(&device, "c8y-mapper-1234".into())
+            .with_status(status)
+            .command_message(&mqtt_schema);
+        converter.try_convert(&previous_request).await.unwrap();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        assert!(
+            software_list_requests(&converter, &device, &messages).is_empty(),
+            "No software list request expected in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_is_not_requested_when_a_pending_request_is_received_after_the_capability(
+    ) {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let previous_request = SoftwareListCommand::new(&device, "c8y-mapper-1234".into())
+            .command_message(&mqtt_schema);
+        converter.try_convert(&previous_request).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        assert!(
+            software_list_requests(&converter, &device, &messages).is_empty(),
+            "No software list request expected in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_is_requested_once_when_the_capability_is_received_repeatedly() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let mut messages = converter.take_software_list_requests();
+        converter.try_convert(&capability).await.unwrap();
+        messages.extend(converter.take_software_list_requests());
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a single software list request in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_is_requested_once_the_previous_request_is_cleared() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let previous_request = SoftwareListCommand::new(&device, "c8y-mapper-1234".into())
+            .with_status(CommandStatus::Successful);
+        converter
+            .try_convert(&previous_request.command_message(&mqtt_schema))
+            .await
+            .unwrap();
+        converter
+            .try_convert(&previous_request.clearing_message(&mqtt_schema))
+            .await
+            .unwrap();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_is_requested_when_the_agent_restarts_with_a_request_still_pending() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let previous_request = SoftwareListCommand::new(&device, "c8y-mapper-1234".into())
+            .command_message(&mqtt_schema);
+        converter.try_convert(&previous_request).await.unwrap();
+
+        let mut capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        capability.retain = false;
+        let mut messages = converter.try_convert(&capability).await.unwrap();
+        messages.extend(converter.take_software_list_requests());
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_is_requested_when_the_agent_restarts_and_resumes_a_cleared_request() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        let previous_request = SoftwareListCommand::new(&device, "c8y-mapper-1234".into())
+            .with_status(CommandStatus::Successful);
+        converter
+            .try_convert(&previous_request.command_message(&mqtt_schema))
+            .await
+            .unwrap();
+        converter
+            .try_convert(&previous_request.clearing_message(&mqtt_schema))
+            .await
+            .unwrap();
+        // Republished by an agent restarted before having seen the clearing message
+        converter
+            .try_convert(&previous_request.command_message(&mqtt_schema))
+            .await
+            .unwrap();
+
+        let mut capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        capability.retain = false;
+        let mut messages = converter.try_convert(&capability).await.unwrap();
+        messages.extend(converter.take_software_list_requests());
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_request_not_issued_by_the_mapper_does_not_prevent_a_new_request() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+
+        // A software list command issued locally, e.g. using `tedge mqtt pub`
+        let local_request =
+            SoftwareListCommand::new(&device, "local-1111".into()).command_message(&mqtt_schema);
+        converter.try_convert(&local_request).await.unwrap();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn software_list_request_pending_for_another_device_does_not_prevent_a_new_request() {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        let mqtt_schema = converter.mqtt_schema.clone();
+        let device = EntityTopicId::default_main_device();
+        let child = EntityTopicId::default_child_device("child1").unwrap();
+
+        let child_request = SoftwareListCommand::new(&child, "c8y-mapper-1234".into())
+            .command_message(&mqtt_schema);
+        register_source_entities(&child_request.topic.name, &mut converter).await;
+        converter.try_convert(&child_request).await.unwrap();
+
+        let capability = SoftwareUpdateCommand::capability_message(&mqtt_schema, &device);
+        converter.try_convert(&capability).await.unwrap();
+        let messages = converter.take_software_list_requests();
+
+        assert_eq!(
+            software_list_requests(&converter, &device, &messages).len(),
+            1,
+            "Expected a software list request in {messages:?}"
+        );
+    }
+
+    fn software_list_requests<'a>(
+        converter: &CumulocityConverter,
+        target: &EntityTopicId,
+        messages: &'a [MqttMessage],
+    ) -> Vec<&'a MqttMessage> {
+        let software_list_topics = converter.mqtt_schema.topics(
+            EntityFilter::Entity(target),
+            ChannelFilter::Command(OperationType::SoftwareList),
+        );
+        messages
+            .iter()
+            .filter(|message| software_list_topics.accept(message))
+            .collect()
+    }
+
+    #[tokio::test]
     async fn custom_operation_ids_are_not_evicted_from_cache_prematurely() {
         let tmp_dir = TempTedgeDir::new();
         let custom_op = r#"exec.topic = "my/custom/topic"
@@ -2632,6 +2983,19 @@ pub(crate) mod tests {
         let random_message = MqttMessage::new(&Topic::new_unchecked("c8y/s/ds"), "510,test");
         converter.try_convert(&random_message).await.unwrap();
         assert_eq!(converter.active_commands.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn smartrest_message_on_builtin_topic_is_not_an_unsupported_topic() {
+        let (capture, _guard) = tedge_test_utils::tracing::TracingCapture::default().start();
+
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+
+        let message = MqttMessage::new(&Topic::new_unchecked("c8y/s/ds"), "510,test-device");
+        converter.try_convert(&message).await.unwrap();
+
+        capture.assert_no_errors();
     }
 
     #[tokio::test]
@@ -2690,6 +3054,40 @@ pub(crate) mod tests {
                       ]}
                 ]
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_invalid_operation_of_a_child_device_is_failed_on_the_smartrest_topic_of_the_child_device(
+    ) {
+        let tmp_dir = TempTedgeDir::new();
+        let (mut converter, _http_proxy) = create_c8y_converter(&tmp_dir);
+        register_source_entities("te/device/childId//", &mut converter).await;
+
+        assert_messages_matching(
+            &converter
+                .convert(&MqttMessage::new(
+                    &Topic::new_unchecked("c8y/devicecontrol/notifications"),
+                    json!({
+                        "id": "123456",
+                        "c8y_SoftwareUpdate": [
+                            {"name": "nodered", "action": "remove", "version": "1.0.0::debian"}
+                        ],
+                        "externalSource": {"externalId": "test-device:device:childId", "type": "c8y_Serial"},
+                    })
+                    .to_string(),
+                ))
+                .await,
+            [
+                (
+                    "c8y/s/us/test-device:device:childId",
+                    "501,c8y_SoftwareUpdate".into(),
+                ),
+                (
+                    "c8y/s/us/test-device:device:childId",
+                    "502,c8y_SoftwareUpdate,Parameter remove is not recognized. It must be install or delete.".into(),
+                ),
+            ],
         );
     }
 
@@ -3045,35 +3443,6 @@ pub(crate) mod tests {
 
         let msgs = converter.convert(&operation_msg).await;
         assert_messages_matching(&msgs, [("c8y/s/us/child0", "114,c8y_Operation".into())]);
-
-        // service command
-        let reg_message = MqttMessage::new(
-            &Topic::new_unchecked("te/device/main/service/service0"),
-            json!({
-                "@type": "service",
-                "@id": "service0",
-                "name": "service0",
-                "@parent": "device/main//",
-            })
-            .to_string(),
-        );
-
-        converter
-            .process_entity_metadata_message(&reg_message)
-            .await
-            .unwrap();
-
-        let service = main_device.default_service_for_device("service0").unwrap();
-        let operation_topic = converter.mqtt_schema.topic_for(
-            &service,
-            &Channel::CommandMetadata {
-                operation: OperationType::Custom("my_operation".to_string()),
-            },
-        );
-        let operation_msg = MqttMessage::new(&operation_topic, "{}");
-
-        let msgs = converter.convert(&operation_msg).await;
-        assert_messages_matching(&msgs, [("c8y/s/us/service0", "114,c8y_Operation".into())]);
     }
 
     fn registered_entities_into_mqtt_messages(
@@ -3096,7 +3465,7 @@ pub(crate) mod tests {
         create_c8y_converter_from_config(config)
     }
 
-    fn c8y_converter_config(tmp_dir: &TempTedgeDir) -> C8yMapperConfig {
+    pub(crate) fn c8y_converter_config(tmp_dir: &TempTedgeDir) -> C8yMapperConfig {
         tmp_dir.dir("operations").dir("c8y");
         tmp_dir.dir("tedge").dir("agent");
         tmp_dir.dir(".tedge-mapper-c8y");
@@ -3155,7 +3524,7 @@ pub(crate) mod tests {
         )
     }
 
-    fn create_c8y_converter_from_config(
+    pub(crate) fn create_c8y_converter_from_config(
         config: C8yMapperConfig,
     ) -> (CumulocityConverter, FakeServerBox<HttpRequest, HttpResult>) {
         let mqtt_builder: SimpleMessageBoxBuilder<MqttMessage, MqttMessage> =

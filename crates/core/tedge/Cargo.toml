@@ -61,19 +61,28 @@ tedge-file-log-plugin = { workspace = true }
 tedge-flows-plugin = { workspace = true }
 tedge-mapper = { workspace = true, default-features = false }
 tedge-p11 = { workspace = true }
+tedge-shell-plugin = { workspace = true }
 tedge-watchdog = { workspace = true }
 tedge-write = { workspace = true }
 tedge_actors = { workspace = true }
 tedge_api = { workspace = true }
 tedge_config = { workspace = true }
+tedge_config_engine = { workspace = true, optional = true }
 tedge_flows = { workspace = true }
+tedge_mapper_config = { workspace = true, optional = true }
 tedge_mqtt_bridge = { workspace = true }
 tedge_supervisor = { workspace = true }
 tedge_system_services = { workspace = true }
 tedge_utils = { workspace = true }
 thiserror = { workspace = true }
 time = { workspace = true }
-tokio = { workspace = true, features = ["macros", "rt", "signal", "time"] }
+tokio = { workspace = true, features = [
+    "io-std",
+    "macros",
+    "rt",
+    "signal",
+    "time",
+] }
 toml = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -106,6 +115,7 @@ default = ["aws", "azure", "c8y"]
 aws = ["tedge-mapper/aws"]
 azure = ["tedge-mapper/azure"]
 c8y = ["tedge-mapper/c8y"]
+mapper-config = ["dep:tedge_mapper_config", "dep:tedge_config_engine"]
 integration-test = []
 
 

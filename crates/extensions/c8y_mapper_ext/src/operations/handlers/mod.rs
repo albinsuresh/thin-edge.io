@@ -2,6 +2,7 @@
 
 mod config_snapshot;
 mod config_update;
+mod control;
 mod custom_operation;
 mod device_profile;
 mod firmware_update;
@@ -38,7 +39,7 @@ use tedge_actors::ClientMessageBox;
 use tedge_actors::LoggingSender;
 use tedge_actors::Sender;
 use tedge_api::entity::EntityExternalId;
-use tedge_api::file_transfer_url::FileTransferUrls;
+use tedge_api::http_url::FileTransferUrls;
 use tedge_api::mqtt_topics::EntityTopicId;
 use tedge_api::mqtt_topics::IdGenerator;
 use tedge_api::mqtt_topics::MqttSchema;
@@ -151,6 +152,10 @@ impl OperationContext {
             }
             OperationType::DeviceProfile => {
                 self.handle_device_profile_state_change(&entity, &cmd_id, &message)
+                    .await
+            }
+            OperationType::Control => {
+                self.handle_control_state_change(&entity, &cmd_id, &message)
                     .await
             }
             OperationType::Custom(_) => {
@@ -341,6 +346,7 @@ fn to_c8y_operation(operation_type: &OperationType) -> Option<CumulocitySupporte
         OperationType::FirmwareUpdate => Some(CumulocitySupportedOperations::C8yFirmware),
         OperationType::SoftwareUpdate => Some(CumulocitySupportedOperations::C8ySoftwareUpdate),
         OperationType::DeviceProfile => Some(CumulocitySupportedOperations::C8yDeviceProfile),
+        OperationType::Control => Some(CumulocitySupportedOperations::C8yServiceCommand),
         // Cannot convert custom operation name systematically
         OperationType::Custom(_) => None,
         // software list is not an c8y, only a fragment, but is a local operation that is spawned as

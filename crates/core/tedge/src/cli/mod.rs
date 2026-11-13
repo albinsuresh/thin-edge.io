@@ -14,6 +14,7 @@ use tedge_file_config_plugin::bin::FileConfigCli;
 use tedge_file_log_plugin::bin::FileLogCli;
 use tedge_flows_plugin::FlowsCli;
 use tedge_mapper::MapperOpt;
+use tedge_shell_plugin::bin::ShellCli;
 use tedge_watchdog::WatchdogOpt;
 use tedge_write::bin::Args as TedgeWriteOpt;
 
@@ -88,6 +89,8 @@ pub enum Component {
     TedgeFileLogPlugin(FileLogCli),
 
     TedgeMapper(MapperOpt),
+
+    TedgeShellPlugin(ShellCli),
 
     TedgeWatchdog(WatchdogOpt),
 
@@ -171,7 +174,7 @@ pub enum TEdgeOpt {
     #[clap(subcommand)]
     Mapper(mapper::MapperCli),
 
-    /// Execute a service command
+    /// Run a control action on a service
     Service(service::TEdgeServiceOpt),
 
     /// Run thin-edge services and plugins

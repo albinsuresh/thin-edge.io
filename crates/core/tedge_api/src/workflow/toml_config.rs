@@ -1,3 +1,4 @@
+use crate::entity::EntityType;
 use crate::mqtt_topics::OperationType;
 use crate::script::ShellScript;
 use crate::substitution::Record;
@@ -10,6 +11,7 @@ use crate::workflow::GenericStateUpdate;
 use crate::workflow::IterateHandlers;
 use crate::workflow::OperationAction;
 use crate::workflow::OperationWorkflow;
+use crate::workflow::OperationWorkflows;
 use crate::workflow::ScriptDefinitionError;
 use crate::workflow::WorkflowDefinitionError;
 use serde::de::Error;
@@ -31,8 +33,12 @@ use std::time::Duration;
 /// The user view of an operation workflow configured using a TOML file.
 #[derive(Clone, Debug, Deserialize)]
 pub struct TomlOperationWorkflow {
-    /// The operation to which this workflow applies
-    pub operation: OperationType,
+    /// The operations to which this workflow applies
+    pub operation: TomlOperationNames,
+
+    /// The type of the entity this workflow applies
+    #[serde(rename = "type", default = "crate::workflow::default_entity_type")]
+    pub entity_type: EntityType,
 
     /// Default handlers used to determine the next state from an action outcome
     #[serde(flatten)]
@@ -41,6 +47,26 @@ pub struct TomlOperationWorkflow {
     /// The states of the state machine
     #[serde(flatten)]
     pub states: HashMap<String, TomlOperationState>,
+}
+
+/// The `operation` property of a workflow: a single operation name, or an array of names
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize)]
+#[serde(
+    untagged,
+    expecting = "an operation name or an array of operation names"
+)]
+pub enum TomlOperationNames {
+    Single(OperationType),
+    Array(Vec<OperationType>),
+}
+
+impl TomlOperationNames {
+    pub fn into_operations(self) -> Vec<OperationType> {
+        match self {
+            TomlOperationNames::Single(operation) => vec![operation],
+            TomlOperationNames::Array(operations) => operations,
+        }
+    }
 }
 
 /// User-friendly representation of an [OperationAction] and associated handlers.
@@ -65,6 +91,10 @@ pub struct TomlOperationState {
     /// Values to be extracted from the sub-operation final state
     #[serde(default)]
     pub output: Option<Value>,
+
+    /// Run the script of this state through sudo, when sudo is enabled and installed
+    #[serde(default)]
+    pub sudo: bool,
 }
 
 /// User-friendly representation of an [OperationAction]
@@ -126,11 +156,15 @@ impl TryFrom<(TomlOperationState, DefaultHandlers)> for OperationAction {
         match input.action {
             TomlOperationAction::Script(script) => {
                 let handlers = ExitHandlers::try_from((input.handlers, defaults))?;
-                Ok(OperationAction::Script(script, handlers))
+                Ok(OperationAction::Script(script, input.sudo.into(), handlers))
             }
             TomlOperationAction::BackgroundScript(script) => {
                 let handlers = ExecHandlers::try_from((input.handlers, defaults))?;
-                Ok(OperationAction::BgScript(script, handlers))
+                Ok(OperationAction::BgScript(
+                    script,
+                    input.sudo.into(),
+                    handlers,
+                ))
             }
             TomlOperationAction::Operation(operation) => match operation.strip_prefix("builtin:") {
                 None => {
@@ -227,19 +261,55 @@ impl TryFrom<(TomlOperationState, DefaultHandlers)> for OperationAction {
     }
 }
 
-impl TryFrom<TomlOperationWorkflow> for OperationWorkflow {
+impl TryFrom<TomlOperationWorkflow> for OperationWorkflows {
     type Error = WorkflowDefinitionError;
 
     fn try_from(input: TomlOperationWorkflow) -> Result<Self, Self::Error> {
-        let operation = input.operation;
+        let operations = input.operation.into_operations();
+        if operations.is_empty() {
+            return Err(WorkflowDefinitionError::NoOperation);
+        }
+
         let default_handlers = DefaultHandlers::try_from(input.handlers)?;
         let mut states = HashMap::new();
         for (state, action_spec) in input.states.into_iter() {
+            let sudo = action_spec.sudo;
             let action = OperationAction::try_from((action_spec, default_handlers.clone()))?;
+            if sudo
+                && !matches!(
+                    action,
+                    OperationAction::Script(..) | OperationAction::BgScript(..)
+                )
+            {
+                return Err(WorkflowDefinitionError::InvalidAction {
+                    state,
+                    action: format!(
+                        "{action} (with `sudo = true`, which applies only to `script` and `background_script`)"
+                    ),
+                });
+            }
             states.insert(state, action);
         }
 
-        OperationWorkflow::try_new(operation, default_handlers, states)
+        let mut workflows: Vec<OperationWorkflow> = Vec::with_capacity(operations.len());
+        for operation in operations {
+            if workflows
+                .iter()
+                .any(|workflow| workflow.operation == operation)
+            {
+                return Err(WorkflowDefinitionError::DuplicatedOperation {
+                    operation: operation.to_string(),
+                });
+            }
+            workflows.push(OperationWorkflow::try_new(
+                input.entity_type,
+                operation,
+                default_handlers.clone(),
+                states.clone(),
+            )?);
+        }
+
+        Ok(OperationWorkflows { workflows })
     }
 }
 
@@ -528,10 +598,12 @@ impl FromStr for ExitCodes {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::workflow::Elevation;
     use crate::workflow::GenericStateUpdate;
     use crate::workflow::StateExcerpt;
     use assert_matches::assert_matches;
     use serde_json::json;
+    use test_case::test_case;
     use ExitCodes::*;
 
     #[test]
@@ -721,11 +793,56 @@ on_success = "successful_reboot"
 on_error = "failed_reboot"
 "#;
         let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        assert_eq!(input.operation, "check".parse().unwrap());
+        assert_eq!(
+            input.operation,
+            TomlOperationNames::Single("check".parse().unwrap())
+        );
         assert_eq!(input.handlers.timeout_second, Some(3600));
         assert_eq!(
             input.handlers.on_timeout,
             Some(TomlStateUpdate::Simple("timeout".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_workflow_with_no_type_applies_to_main_device() {
+        let file = r#"operation = "restart""#;
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        assert_eq!(input.entity_type, EntityType::MainDevice);
+    }
+
+    #[test_case("device", EntityType::MainDevice; "a device")]
+    #[test_case("child-device", EntityType::ChildDevice; "a child device")]
+    #[test_case("service", EntityType::Service; "a service")]
+    fn a_workflow_can_be_typed(type_field: &str, expected: EntityType) {
+        let file = format!(
+            r#"
+operation = "restart"
+type = "{type_field}"
+
+[init]
+action = "proceed"
+on_success = "successful"
+"#
+        );
+
+        let workflow = OperationWorkflow::from_toml(&file);
+        assert_eq!(workflow.entity_type, expected);
+    }
+
+    #[test]
+    fn a_workflow_with_an_unknown_type_is_rejected() {
+        let file = r#"
+operation = "restart"
+type = "gadget"
+"#;
+        let error = toml::from_str::<TomlOperationWorkflow>(file).unwrap_err();
+
+        assert!(
+            error.to_string().contains(
+                "unknown variant `gadget`, expected one of `device`, `child-device`, `service`"
+            ),
+            "{error}"
         );
     }
 
@@ -743,7 +860,7 @@ script = "/some/script/which/fails"
 "#;
 
         let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let error = OperationWorkflow::try_from(input).unwrap_err();
+        let error = OperationWorkflows::try_from(input).unwrap_err();
         assert_eq!(
             error,
             WorkflowDefinitionError::InvalidAction {
@@ -755,11 +872,142 @@ script = "/some/script/which/fails"
                             command: "/some/script/which/fails".to_string(),
                             args: vec![]
                         },
+                        Elevation::None,
                         ExitHandlers::default()
                     )
                 ),
             }
         )
+    }
+
+    #[test]
+    fn a_workflow_can_be_defined_for_an_array_of_operations() {
+        let file = r#"
+operation = ["start", "stop"]
+type = "service"
+
+[init]
+action = "proceed"
+on_success = "successful"
+"#;
+
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        let definition = OperationWorkflows::try_from(input).unwrap();
+        let operations: Vec<_> = definition
+            .workflows
+            .iter()
+            .map(|workflow| (workflow.entity_type, workflow.operation.to_string()))
+            .collect();
+        assert_eq!(
+            operations,
+            vec![
+                (EntityType::Service, "start".to_string()),
+                (EntityType::Service, "stop".to_string())
+            ]
+        );
+        assert_eq!(
+            definition.workflows[0].states,
+            definition.workflows[1].states
+        );
+    }
+
+    #[test]
+    fn an_empty_array_of_operations_is_rejected() {
+        let file = r#"
+operation = []
+
+[init]
+action = "proceed"
+on_success = "successful"
+"#;
+
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        let error = OperationWorkflows::try_from(input).unwrap_err();
+        assert_eq!(error, WorkflowDefinitionError::NoOperation);
+    }
+
+    #[test]
+    fn an_operation_given_twice_is_rejected() {
+        let file = r#"
+operation = ["start", "stop", "start"]
+
+[init]
+action = "proceed"
+on_success = "successful"
+"#;
+
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        let error = OperationWorkflows::try_from(input).unwrap_err();
+        assert_eq!(
+            error,
+            WorkflowDefinitionError::DuplicatedOperation {
+                operation: "start".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_builtin_operation_is_rejected_for_another_operation_awaited_from_a_shared_state() {
+        let file = r#"
+operation = "software_list"
+
+[init]
+script = "/etc/tedge/operations/pick-action.sh"
+on_stdout = ["list_first", "update_first"]
+
+[list_first]
+operation = "builtin:software_list"
+on_exec = "executing"
+
+[update_first]
+operation = "builtin:software_update"
+on_exec = "executing"
+
+[executing]
+action = "await-operation-completion"
+on_success = "successful"
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#;
+
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        let error = OperationWorkflows::try_from(input).unwrap_err();
+        assert_eq!(
+            error,
+            WorkflowDefinitionError::InvalidBuiltinOperation {
+                main_operation: "software_list".to_string(),
+                builtin_operation: "software_update".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn a_builtin_operation_is_rejected_for_the_other_operations_of_an_array() {
+        let file = r#"
+operation = ["software_update", "software_check"]
+
+[init]
+action = "proceed"
+on_success = "scheduled"
+
+[scheduled]
+operation = "builtin:software_update"
+on_exec = "successful"
+"#;
+
+        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
+        let error = OperationWorkflows::try_from(input).unwrap_err();
+        assert_eq!(
+            error,
+            WorkflowDefinitionError::InvalidBuiltinOperation {
+                main_operation: "software_check".to_string(),
+                builtin_operation: "software_update".to_string()
+            }
+        );
     }
 
     #[test]
@@ -787,8 +1035,7 @@ action = "cleanup"
 [failed]
 action = "cleanup"
 "#;
-        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let workflow = OperationWorkflow::try_from(input).unwrap();
+        let workflow = OperationWorkflow::from_toml(file);
 
         match workflow.states.get("apply_operation").unwrap() {
             OperationAction::Iterate(
@@ -819,7 +1066,7 @@ on_success = "successful"
 on_error = "failed"
 "#;
         let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let res = OperationWorkflow::try_from(input);
+        let res = OperationWorkflows::try_from(input);
         assert_matches!(res, Err(WorkflowDefinitionError::MissingState { state }) if state == *"on_next");
     }
 
@@ -834,7 +1081,7 @@ on_next = "next_operation"
 on_error = "failed"
 "#;
         let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let res = OperationWorkflow::try_from(input);
+        let res = OperationWorkflows::try_from(input);
         assert_matches!(res, Err(WorkflowDefinitionError::MissingState { state }) if state == *"on_success");
     }
 
@@ -850,7 +1097,7 @@ on_success = "successful"
 on_error = "failed"
 "#;
         let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let res = OperationWorkflow::try_from(input);
+        let res = OperationWorkflows::try_from(input);
         assert_matches!(res, Err(WorkflowDefinitionError::InvalidPathExpression(_)));
     }
 
@@ -875,8 +1122,7 @@ action = "cleanup"
 [failed]
 action = "cleanup"
 "#;
-        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let workflow = OperationWorkflow::try_from(input).unwrap();
+        let workflow = OperationWorkflow::from_toml(file);
 
         match workflow.states.get("download").unwrap() {
             OperationAction::Download(input_excerpt, handlers) => {
@@ -914,8 +1160,7 @@ action = "cleanup"
 [failed]
 action = "cleanup"
 "#;
-        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let workflow = OperationWorkflow::try_from(input).unwrap();
+        let workflow = OperationWorkflow::from_toml(file);
 
         match workflow.states.get("set").unwrap() {
             OperationAction::BuiltInOperationStep(operation, step, input_excerpt, handlers) => {
@@ -954,8 +1199,7 @@ action = "cleanup"
 [failed]
 action = "cleanup"
 "#;
-        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let workflow = OperationWorkflow::try_from(input).unwrap();
+        let workflow = OperationWorkflow::from_toml(file);
 
         match workflow.states.get("upload").unwrap() {
             OperationAction::Upload(input_excerpt, handlers) => {
@@ -997,8 +1241,7 @@ action = "cleanup"
 [failed]
 action = "cleanup"
 "#;
-        let input: TomlOperationWorkflow = toml::from_str(file).unwrap();
-        let workflow = OperationWorkflow::try_from(input).unwrap();
+        let workflow = OperationWorkflow::from_toml(file);
 
         match workflow.states.get("get").unwrap() {
             OperationAction::BuiltInOperationStep(operation, step, input_excerpt, handlers) => {
@@ -1012,5 +1255,178 @@ action = "cleanup"
             }
             other => panic!("Expected BuiltInOperationStep action, but got {:?}", other),
         }
+    }
+
+    #[test]
+    fn sudo_elevates_a_script() {
+        let workflow = OperationWorkflow::from_toml(&workflow_with_state(
+            r#"
+script = "tedge service restart nginx"
+sudo = true
+on_success = "successful"
+"#,
+        ));
+
+        assert_matches!(
+            workflow.states.get("test"),
+            Some(OperationAction::Script(_, Elevation::Sudo, _))
+        );
+    }
+
+    #[test]
+    fn sudo_elevates_a_background_script() {
+        let workflow = OperationWorkflow::from_toml(&workflow_with_state(
+            r#"
+background_script = "reboot"
+sudo = true
+on_exec = "successful"
+"#,
+        ));
+
+        assert_matches!(
+            workflow.states.get("test"),
+            Some(OperationAction::BgScript(_, Elevation::Sudo, _))
+        );
+    }
+
+    #[test]
+    fn get_action_injects_the_payload_into_an_elevated_background_script() {
+        let workflow = OperationWorkflow::from_toml(&workflow_with_state(
+            r#"
+background_script = "systemctl restart ${.payload.serviceName}"
+sudo = true
+on_exec = "successful"
+"#,
+        ));
+        let state = GenericCommandState::new(
+            "te/device/main///cmd/sudo-test/1".try_into().unwrap(),
+            "test".to_string(),
+            json!({"status": "test", "serviceName": "nginx"}),
+        );
+
+        let action = workflow.get_action(&state).unwrap();
+
+        assert_matches!(
+            action,
+            OperationAction::BgScript(script, Elevation::Sudo, _)
+                if script.to_string() == "systemctl restart nginx"
+        );
+    }
+
+    #[test_case("sudo = false")]
+    #[test_case("")]
+    fn a_script_is_not_elevated_by_default(sudo: &str) {
+        let workflow = OperationWorkflow::from_toml(&workflow_with_state(&format!(
+            r#"
+script = "tedge service restart nginx"
+{sudo}
+on_success = "successful"
+"#,
+        )));
+
+        assert_matches!(
+            workflow.states.get("test"),
+            Some(OperationAction::Script(_, Elevation::None, _))
+        );
+    }
+
+    #[test]
+    fn sudo_cannot_be_derived_from_the_payload() {
+        let file = workflow_with_state(
+            r#"
+script = "tedge service restart nginx"
+sudo = "${.payload.elevate}"
+on_success = "successful"
+"#,
+        );
+
+        assert!(toml::from_str::<TomlOperationWorkflow>(&file).is_err());
+    }
+
+    #[test]
+    fn sudo_is_rejected_on_a_state_running_no_script() {
+        let error = try_workflow_with_state(
+            r#"
+action = "proceed"
+sudo = true
+on_success = "successful"
+"#,
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error.to_string(),
+            "Invalid action on test state: move to successful state \
+             (with `sudo = true`, which applies only to `script` and `background_script`)"
+        );
+    }
+
+    #[test]
+    fn sudo_is_rejected_on_a_sub_operation_with_an_input_script() {
+        let error = try_workflow_with_state(
+            r#"
+operation = "restart"
+input_script = "/some/script.sh"
+sudo = true
+on_exec = "successful"
+"#,
+        )
+        .unwrap_err();
+
+        assert_matches!(error, WorkflowDefinitionError::InvalidAction { state, .. } if state == "test");
+    }
+
+    #[test]
+    fn sudo_false_is_accepted_on_a_state_running_no_script() {
+        assert!(try_workflow_with_state(
+            r#"
+action = "proceed"
+sudo = false
+on_success = "successful"
+"#,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn an_elevated_script_is_displayed_with_sudo() {
+        let workflow = OperationWorkflow::from_toml(&workflow_with_state(
+            r#"
+script = "tedge service restart nginx"
+sudo = true
+on_success = "successful"
+"#,
+        ));
+
+        assert_eq!(
+            workflow.states.get("test").unwrap().to_string(),
+            "tedge service restart nginx (sudo = true)"
+        );
+    }
+
+    fn workflow_with_state(state: &str) -> String {
+        format!(
+            r#"
+operation = "sudo-test"
+
+[init]
+action = "proceed"
+on_success = "test"
+
+[test]
+{state}
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#
+        )
+    }
+
+    fn try_workflow_with_state(state: &str) -> Result<OperationWorkflows, WorkflowDefinitionError> {
+        let input: TomlOperationWorkflow = toml::from_str(&workflow_with_state(state)).unwrap();
+        OperationWorkflows::try_from(input)
     }
 }

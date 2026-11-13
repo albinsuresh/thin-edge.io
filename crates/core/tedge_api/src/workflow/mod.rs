@@ -6,6 +6,7 @@ pub mod state;
 pub mod supervisor;
 mod toml_config;
 
+use crate::entity::EntityType;
 use crate::mqtt_topics::EntityTopicId;
 use crate::mqtt_topics::MqttSchema;
 use crate::mqtt_topics::OperationType;
@@ -54,10 +55,16 @@ pub fn version_is_builtin(version: &str) -> bool {
     version == BUILT_IN
 }
 
+pub(crate) fn default_entity_type() -> EntityType {
+    EntityType::MainDevice
+}
+
 /// An OperationWorkflow defines the state machine that rules an operation
-#[derive(Clone, Debug, Deserialize)]
-#[serde(try_from = "toml_config::TomlOperationWorkflow")]
+#[derive(Clone, Debug)]
 pub struct OperationWorkflow {
+    /// The type of the entity this workflow applies
+    pub entity_type: EntityType,
+
     /// The operation to which this workflow applies
     pub operation: OperationType,
 
@@ -66,6 +73,55 @@ pub struct OperationWorkflow {
 
     /// The states of the state machine
     pub states: HashMap<StateName, OperationAction>,
+}
+
+/// The workflows read from one workflow file
+///
+/// A file with `operation = ["start", "stop"]` gives two workflows: one for `start` and one for `stop`.
+#[derive(Clone, Debug, Deserialize)]
+#[serde(try_from = "toml_config::TomlOperationWorkflow")]
+pub struct OperationWorkflows {
+    pub workflows: Vec<OperationWorkflow>,
+}
+
+#[cfg(test)]
+impl OperationWorkflow {
+    /// Parse the definition of a workflow for a single operation
+    pub(crate) fn from_toml(definition: &str) -> Self {
+        toml::from_str::<OperationWorkflows>(definition)
+            .expect("Expect a valid workflow definition")
+            .workflows
+            .remove(0)
+    }
+}
+
+impl OperationWorkflows {
+    pub fn find(self, entity_type: EntityType, operation: &str) -> Option<OperationWorkflow> {
+        self.workflows.into_iter().find(|workflow| {
+            workflow.entity_type == entity_type && workflow.operation.to_string() == operation
+        })
+    }
+}
+
+/// The privileges a workflow asks for to run a script
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Elevation {
+    /// Run the script as the agent user
+    #[default]
+    None,
+
+    /// Run the script through sudo, when sudo is enabled and installed
+    Sudo,
+}
+
+impl From<bool> for Elevation {
+    fn from(sudo: bool) -> Self {
+        if sudo {
+            Elevation::Sudo
+        } else {
+            Elevation::None
+        }
+    }
 }
 
 /// What needs to be done to advance an operation request in some state
@@ -120,16 +176,23 @@ pub enum OperationAction {
     RestartAgent(ExecHandlers),
 
     /// A script has to be executed
-    Script(ShellScript, ExitHandlers),
+    ///
+    /// ```toml
+    /// script = "/some/script.sh ${.payload.x}"
+    /// sudo = true
+    /// on_success = "<state>"
+    /// ```
+    Script(ShellScript, Elevation, ExitHandlers),
 
     /// Executes a script but move to the next state without waiting for that script to return
     ///
     /// Notably such a script can trigger a device reboot or an agent restart.
     /// ```toml
-    /// background_script = "sudo systemctl restart tedge-agent"
+    /// background_script = "systemctl restart tedge-agent"
+    /// sudo = true
     /// on_exec = "<state>"
     /// ```
-    BgScript(ShellScript, ExecHandlers),
+    BgScript(ShellScript, Elevation, ExecHandlers),
 
     /// Generic download action (reusable across operations)
     ///
@@ -228,8 +291,8 @@ impl Display for OperationAction {
             OperationAction::BuiltIn(_, _) => "builtin action".to_string(),
             OperationAction::AwaitingAgentRestart { .. } => "await agent restart".to_string(),
             OperationAction::RestartAgent(_) => "restart agent".to_string(),
-            OperationAction::Script(script, _) => script.to_string(),
-            OperationAction::BgScript(script, _) => script.to_string(),
+            OperationAction::Script(script, elevation, _) => script_display(script, *elevation),
+            OperationAction::BgScript(script, elevation, _) => script_display(script, *elevation),
             OperationAction::Download(_, _) => "builtin download action".to_string(),
             OperationAction::Upload(_, _) => "builtin upload action".to_string(),
             OperationAction::Operation(operation, maybe_script, _, _) => match maybe_script {
@@ -257,10 +320,18 @@ impl Display for OperationAction {
     }
 }
 
+fn script_display(script: &ShellScript, elevation: Elevation) -> String {
+    match elevation {
+        Elevation::None => script.to_string(),
+        Elevation::Sudo => format!("{script} (sudo = true)"),
+    }
+}
+
 impl OperationWorkflow {
     /// Return a new OperationWorkflow unless there are errors
     /// such as missing or ill-defined states.
     pub fn try_new(
+        entity_type: EntityType,
         operation: OperationType,
         handlers: DefaultHandlers,
         mut states: HashMap<StateName, OperationAction>,
@@ -313,6 +384,7 @@ impl OperationWorkflow {
         }
 
         Ok(OperationWorkflow {
+            entity_type,
             operation,
             handlers,
             states,
@@ -345,6 +417,7 @@ impl OperationWorkflow {
         .collect();
 
         OperationWorkflow {
+            entity_type: EntityType::MainDevice,
             operation,
             handlers: DefaultHandlers::default(),
             states,
@@ -355,7 +428,7 @@ impl OperationWorkflow {
     ///
     /// The point is to raise an error to the user when a workflow definition cannot be parsed,
     /// instead of silently ignoring the commands.
-    pub fn ill_formed(operation: String, reason: String) -> Self {
+    pub fn ill_formed(entity_type: EntityType, operation: String, reason: String) -> Self {
         let states = [
             ("init", OperationAction::MoveTo("executing".into())),
             (
@@ -369,6 +442,7 @@ impl OperationWorkflow {
         .collect();
 
         OperationWorkflow {
+            entity_type,
             operation: operation.as_str().into(),
             handlers: DefaultHandlers::default(),
             states,
@@ -403,6 +477,8 @@ impl OperationWorkflow {
             | OperationType::ConfigSnapshot
             | OperationType::ConfigUpdate
             | OperationType::Health => None,
+            // An entity declares the actions of its control command itself
+            OperationType::Control => None,
         }
     }
 
@@ -424,11 +500,11 @@ impl OperationWorkflow {
 impl OperationAction {
     pub fn inject_state(&self, state: &GenericCommandState) -> Self {
         match self {
-            OperationAction::Script(script, handlers) => {
-                OperationAction::Script(script.inject_values(state), handlers.clone())
+            OperationAction::Script(script, elevation, handlers) => {
+                OperationAction::Script(script.inject_values(state), *elevation, handlers.clone())
             }
-            OperationAction::BgScript(script, handlers) => {
-                OperationAction::BgScript(script.inject_values(state), handlers.clone())
+            OperationAction::BgScript(script, elevation, handlers) => {
+                OperationAction::BgScript(script.inject_values(state), *elevation, handlers.clone())
             }
             OperationAction::Operation(operation_expr, optional_script, input, handlers) => {
                 let operation = state.inject_values_into_template(operation_expr);

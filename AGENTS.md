@@ -213,6 +213,7 @@ Plugins are **separate executables** (not dynamically loaded libraries) that han
 - `tedge-file-log-plugin`: Log file uploads
 - `c8y-firmware-plugin`: Firmware updates
 - `c8y-remote-access-plugin`: Remote SSH/VNC access
+- `tedge-shell-plugin`: Shell command execution (`shell_execute` operation)
 
 **Plugin benefits:**
 - Process isolation (crash safety)
@@ -223,7 +224,9 @@ Plugins are **separate executables** (not dynamically loaded libraries) that han
 
 ### General Guidelines
 
-Refer to @CODING_GUIDELINES.md
+Refer to @CODING_GUIDELINES.md and @CODING_STANDARDS.md.
+CODING_STANDARDS.md is what code is reviewed against.
+Follow all of it when writing code, including the rules tagged **(polish)**.
 
 ### Actor Development Patterns
 
@@ -297,6 +300,9 @@ at clause boundaries (after commas, semicolons, colons, or dashes).
 When editing existing documents that don't use semantic line breaks,
 apply them only to the lines you add or modify.
 Do not reformat the rest of the document.
+
+PR descriptions and GitHub comments are the exception:
+GitHub shows every line break in them, so write each paragraph on a single line.
 
 ## Troubleshooting
 

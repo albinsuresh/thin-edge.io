@@ -1,6 +1,8 @@
+use crate::operation_workflows::entity_store_client::EntityStoreClient;
 use crate::operation_workflows::message_box::CommandDispatcher;
 use crate::operation_workflows::message_box::SyncSignalDispatcher;
 use crate::operation_workflows::persist::WorkflowRepository;
+use crate::shell_execute::SHELL_EXECUTE_OPERATION;
 use crate::state_repository::state::AgentStateRepository;
 use crate::Capabilities;
 use async_trait::async_trait;
@@ -18,16 +20,19 @@ use tedge_actors::MessageReceiver;
 use tedge_actors::RuntimeError;
 use tedge_actors::Sender;
 use tedge_actors::UnboundedLoggingReceiver;
+use tedge_api::entity::EntityType;
 use tedge_api::mqtt_topics::Channel;
 use tedge_api::mqtt_topics::EntityTopicError;
 use tedge_api::mqtt_topics::EntityTopicId;
 use tedge_api::mqtt_topics::MqttSchema;
 use tedge_api::mqtt_topics::OperationType;
 use tedge_api::mqtt_topics::SignalType;
+use tedge_api::script::ShellScript;
 use tedge_api::workflow::extract_json_output;
 use tedge_api::workflow::log::log_dir::OperationLogs;
 use tedge_api::workflow::CommandBoard;
 use tedge_api::workflow::CommandId;
+use tedge_api::workflow::Elevation;
 use tedge_api::workflow::GenericCommandData;
 use tedge_api::workflow::GenericCommandMetadata;
 use tedge_api::workflow::GenericCommandState;
@@ -39,6 +44,8 @@ use tedge_api::workflow::OperationStepRequest;
 use tedge_api::workflow::OperationStepResponse;
 use tedge_api::workflow::WorkflowExecutionError;
 use tedge_api::CommandLog;
+use tedge_config::SudoCommandBuilder;
+use tedge_config::SudoResolution;
 use tedge_downloader_ext::DownloadRequest;
 use tedge_downloader_ext::DownloadResult;
 use tedge_file_system_ext::FsWatchEvent;
@@ -48,6 +55,7 @@ use tedge_script_ext::Execute;
 use tedge_uploader_ext::UploadRequest;
 use tedge_uploader_ext::UploadResult;
 use tokio::time::sleep;
+use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::warn;
@@ -62,7 +70,19 @@ type UploaderResult = (String, UploadResult);
 #[derive(Debug)]
 pub struct InternalCommandState(GenericCommandState);
 
-fan_in_message_type!(AgentInput[MqttMessage, InternalCommandState, GenericCommandData, FsWatchEvent] : Debug);
+#[derive(Debug)]
+pub struct ResolvedCommandTarget {
+    command_topic: String,
+    entity_type: Option<EntityType>,
+}
+
+pub(crate) struct CommandAwaitingLookup {
+    operation: OperationType,
+    cmd_id: String,
+    state: GenericCommandState,
+}
+
+fan_in_message_type!(AgentInput[MqttMessage, InternalCommandState, GenericCommandData, FsWatchEvent, ResolvedCommandTarget] : Debug);
 
 pub struct WorkflowActor {
     pub(crate) mqtt_schema: MqttSchema,
@@ -79,11 +99,15 @@ pub struct WorkflowActor {
     >,
     pub(crate) sync_signal_dispatcher: SyncSignalDispatcher,
     pub(crate) command_sender: DynSender<InternalCommandState>,
+    pub(crate) resolved_target_sender: DynSender<ResolvedCommandTarget>,
     pub(crate) mqtt_publisher: LoggingSender<MqttMessage>,
     pub(crate) script_runner: ClientMessageBox<Execute, std::io::Result<Output>>,
     pub(crate) downloader: ClientMessageBox<DownloaderRequest, DownloaderResult>,
     pub(crate) uploader: ClientMessageBox<UploaderRequest, UploaderResult>,
+    pub(crate) entity_store: EntityStoreClient,
+    pub(crate) pending_lookups: HashMap<String, CommandAwaitingLookup>,
     pub(crate) tmp_dir: Utf8PathBuf,
+    pub(crate) sudo: SudoCommandBuilder,
 }
 
 #[async_trait]
@@ -102,6 +126,9 @@ impl Actor for WorkflowActor {
                 AgentInput::MqttMessage(message) => {
                     self.process_mqtt_message(message).await?;
                 }
+                AgentInput::ResolvedCommandTarget(resolved) => {
+                    self.process_resolved_command_target(resolved).await?;
+                }
                 AgentInput::InternalCommandState(InternalCommandState(command_state)) => {
                     self.process_command_update(command_state).await?;
                 }
@@ -114,7 +141,7 @@ impl Actor for WorkflowActor {
                     self.publish_builtin_capability(operation, payload).await?;
                 }
                 AgentInput::FsWatchEvent(file_update) => {
-                    if let Some(updated_capability) = self
+                    for updated_capability in self
                         .workflow_repository
                         .update_operation_workflows(
                             &self.mqtt_schema,
@@ -133,6 +160,37 @@ impl Actor for WorkflowActor {
 }
 
 impl WorkflowActor {
+    /// The script to launch for a workflow step, through sudo when the step asks for it
+    ///
+    /// Also returns whether the script is actually launched through sudo.
+    async fn launched_script(
+        &self,
+        script: ShellScript,
+        elevation: Elevation,
+        log_file: &mut CommandLog,
+    ) -> (ShellScript, bool) {
+        if elevation == Elevation::None {
+            return (script, false);
+        }
+        let (launched, sudo) = self.sudo.script(script);
+        if let Some(warning) = sudo.warning(&launched.command) {
+            log_file.log_warning(&warning).await;
+        }
+        (launched, matches!(sudo, SudoResolution::Sudo(_)))
+    }
+
+    /// Check that the sudoers rules allow a script to be run through sudo
+    async fn sudo_authorizes(&self, script: &ShellScript) -> bool {
+        let sudo = self.sudo.clone();
+        let listed = script.clone();
+        tokio::task::spawn_blocking(move || sudo.is_authorized(&listed.command, &listed.args))
+            .await
+            .unwrap_or_else(|err| {
+                warn!("Cannot check if sudo allows '{}': {err}", script.command);
+                true
+            })
+    }
+
     async fn publish_operation_capabilities(&mut self) -> Result<(), RuntimeError> {
         for capability in self
             .workflow_repository
@@ -165,13 +223,13 @@ impl WorkflowActor {
     /// but also from *this* actor as all its state transitions are published over MQTT.
     /// Only the former will be actually processed with [Self::process_command_update].
     async fn process_mqtt_message(&mut self, message: MqttMessage) -> Result<(), RuntimeError> {
-        let Ok((_, channel)) = self.mqtt_schema.entity_channel_of(&message.topic) else {
+        let Ok((target, channel)) = self.mqtt_schema.entity_channel_of(&message.topic) else {
             error!("Unknown topic: {}", message.topic.name);
             return Ok(());
         };
         match channel {
             Channel::Command { operation, cmd_id } => {
-                self.process_command_message(message, operation, cmd_id)
+                self.process_command_message(message, target, operation, cmd_id)
                     .await
             }
             Channel::Signal { signal_type } => {
@@ -228,6 +286,7 @@ impl WorkflowActor {
     async fn process_command_message(
         &mut self,
         message: MqttMessage,
+        target: EntityTopicId,
         operation: OperationType,
         cmd_id: String,
     ) -> Result<(), RuntimeError> {
@@ -239,13 +298,97 @@ impl WorkflowActor {
             error!("Invalid command payload: {}", message.topic.name);
             return Ok(());
         };
+
+        // The device this agent runs on is matched as `MainDevice`, even when the entity store
+        // registered it as a child device: a workflow of a device is registered under `MainDevice`.
+        let entity_type = if target == self.device_topic_id {
+            EntityType::MainDevice
+        } else if let Some(command) = self
+            .workflow_repository
+            .pending_commands()
+            .entry(&state.topic.name)
+        {
+            // If the command is in progress on this device, the entity type is already recorded in the command board
+            command.entity_type
+        } else if state.is_init() {
+            let command = CommandAwaitingLookup {
+                operation,
+                cmd_id,
+                state,
+            };
+            self.start_target_lookup(target, command);
+            return Ok(());
+        } else {
+            // A cleared command must not be executed when the lookup of its target completes
+            self.pending_lookups.remove(&state.topic.name);
+            // A non-init state command that is not registered in the command board means it was not started by this agent, so it must be ignored
+            return Ok(());
+        };
+
+        self.apply_external_update(entity_type, operation, cmd_id, state)
+            .await
+    }
+
+    /// Look up the target of a command in a background task, not to block the processing of other messages
+    fn start_target_lookup(&mut self, target: EntityTopicId, command: CommandAwaitingLookup) {
+        let command_topic = command.state.topic.name.clone();
+        // A lookup already running for this command applies to the latest state of the command
+        if self
+            .pending_lookups
+            .insert(command_topic.clone(), command)
+            .is_some()
+        {
+            return;
+        }
+
+        let mut entity_store = self.entity_store.clone();
+        let mut sender = self.resolved_target_sender.sender_clone();
+        let own_device = self.device_topic_id.clone();
+        tokio::spawn(async move {
+            let entity_type = service_of_device(&mut entity_store, &own_device, &target).await;
+            let resolved = ResolvedCommandTarget {
+                command_topic,
+                entity_type,
+            };
+            if sender.send(resolved).await.is_err() {
+                debug!("The command addressed to {target} is dropped, as the workflow actor has stopped");
+            }
+        });
+    }
+
+    async fn process_resolved_command_target(
+        &mut self,
+        resolved: ResolvedCommandTarget,
+    ) -> Result<(), RuntimeError> {
+        let Some(command) = self.pending_lookups.remove(&resolved.command_topic) else {
+            return Ok(());
+        };
+        let Some(entity_type) = resolved.entity_type else {
+            return Ok(());
+        };
+        self.apply_external_update(
+            entity_type,
+            command.operation,
+            command.cmd_id,
+            command.state,
+        )
+        .await
+    }
+
+    async fn apply_external_update(
+        &mut self,
+        entity_type: EntityType,
+        operation: OperationType,
+        cmd_id: String,
+        state: GenericCommandState,
+    ) -> Result<(), RuntimeError> {
         let step = state.status.clone();
 
         let mut log_file = self.open_command_log(&state, &operation, &cmd_id).await;
 
         match self
             .workflow_repository
-            .apply_external_update(&operation, state)
+            .apply_external_update(entity_type, &operation, state)
             .await
         {
             Ok(None) => (),
@@ -283,7 +426,8 @@ impl WorkflowActor {
         &mut self,
         state: GenericCommandState,
     ) -> Result<(), RuntimeError> {
-        let Ok((operation, cmd_id)) = self.extract_command_identifiers(&state.topic.name) else {
+        let Ok((target, operation, cmd_id)) = self.extract_command_identifiers(&state.topic.name)
+        else {
             error!("Unknown command channel: {}", state.topic.name);
             return Ok(());
         };
@@ -392,13 +536,17 @@ impl WorkflowActor {
                 let new_state = state.update(handlers.on_timeout);
                 self.publish_command_state(new_state, &mut log_file).await
             }
-            OperationAction::Script(script, handlers) => {
+            OperationAction::Script(script, elevation, handlers) => {
                 let step = &state.status;
                 info!("Processing {operation} operation {step} step with script: {script}");
 
-                let script_name = script.command.clone();
+                let original = script.clone();
+                let (script, through_sudo) =
+                    self.launched_script(script, elevation, &mut log_file).await;
+                let launched_program = script.command.clone();
+                let command_line = script.to_string();
                 let command = {
-                    let command = Execute::new(script_name.clone(), script.args);
+                    let command = Execute::new(script.command, script.args);
                     match (
                         handlers.graceful_timeout(),
                         handlers.forceful_timeout_extension(),
@@ -411,12 +559,33 @@ impl WorkflowActor {
                     }
                 };
                 let output = self.script_runner.await_response(command).await?;
-                log_file.log_script_output(output.as_ref()).await;
+                log_file
+                    .log_command_and_output(&command_line, output.as_ref())
+                    .await;
 
+                // sudo exits with 1 when it refuses to run a command,
+                // which cannot be told apart from the script itself exiting with 1
+                // without asking sudo whether the script is allowed.
+                let refused_by_sudo = through_sudo
+                    && matches!(&output, Ok(output) if output.status.code() == Some(1))
+                    && !self.sudo_authorizes(&original).await;
+
+                // Failure reasons name the script, unless sudo refused to run it
+                let script_name = if refused_by_sudo {
+                    log_file
+                        .log_error(&format!(
+                            "sudo refused to run '{}': the command is not found, or not allowed by the sudoers rules",
+                            original.command
+                        ))
+                        .await;
+                    launched_program
+                } else {
+                    original.command
+                };
                 let new_state = state.update_with_script_output(script_name, output, handlers);
                 self.publish_command_state(new_state, &mut log_file).await
             }
-            OperationAction::BgScript(script, handlers) => {
+            OperationAction::BgScript(script, elevation, handlers) => {
                 let next_state = &handlers.on_exec.status;
                 info!(
                     "Moving {operation} operation to {next_state} state before running: {script}"
@@ -425,9 +594,13 @@ impl WorkflowActor {
                 self.publish_command_state(new_state, &mut log_file).await?;
 
                 // Run the command, but ignore its result
+                let (script, _) = self.launched_script(script, elevation, &mut log_file).await;
+                let command_line = script.to_string();
                 let command = Execute::new(script.command, script.args);
                 let output = self.script_runner.await_response(command).await?;
-                log_file.log_script_output(output.as_ref()).await;
+                log_file
+                    .log_command_and_output(&command_line, output.as_ref())
+                    .await;
                 Ok(())
             }
             OperationAction::Download(input_excerpt, handlers) => {
@@ -614,9 +787,12 @@ impl WorkflowActor {
                 let generated_init_state = match input_script {
                     None => GenericStateUpdate::empty_payload(),
                     Some(script) => {
+                        let command_line = script.to_string();
                         let command = Execute::new(script.command.clone(), script.args);
                         let output = self.script_runner.await_response(command).await?;
-                        log_file.log_script_output(output.as_ref()).await;
+                        log_file
+                            .log_command_and_output(&command_line, output.as_ref())
+                            .await;
                         match extract_json_output(&script.command, output) {
                             Ok(init_state) => init_state,
                             Err(reason) => {
@@ -632,7 +808,7 @@ impl WorkflowActor {
                 let sub_cmd_input = input_excerpt.extract_value_from(&state);
                 let sub_cmd_init_state = GenericCommandState::sub_command_init_state(
                     &self.mqtt_schema,
-                    &self.device_topic_id,
+                    &target,
                     operation,
                     cmd_id,
                     sub_operation,
@@ -789,7 +965,7 @@ impl WorkflowActor {
             .and_then(|root_topic| self.extract_command_identifiers(root_topic).ok())
         {
             None => (None, None),
-            Some((op, id)) => (Some(op.to_string()), Some(id)),
+            Some((_, op, id)) => (Some(op.to_string()), Some(id)),
         };
 
         self.log_dir
@@ -878,10 +1054,10 @@ impl WorkflowActor {
     fn extract_command_identifiers(
         &self,
         topic: impl AsRef<str>,
-    ) -> Result<(OperationType, CommandId), CommandTopicError> {
-        let (_, channel) = self.mqtt_schema.entity_channel_of(topic)?;
+    ) -> Result<(EntityTopicId, OperationType, CommandId), CommandTopicError> {
+        let (entity, channel) = self.mqtt_schema.entity_channel_of(topic)?;
         match channel {
-            Channel::Command { operation, cmd_id } => Ok((operation, cmd_id)),
+            Channel::Command { operation, cmd_id } => Ok((entity, operation, cmd_id)),
             _ => Err(CommandTopicError::InvalidCommandTopic),
         }
     }
@@ -891,6 +1067,9 @@ impl WorkflowActor {
             OperationType::ConfigUpdate => self.capabilities.config_update,
             OperationType::ConfigSnapshot => self.capabilities.config_snapshot,
             OperationType::LogUpload => self.capabilities.log_upload,
+            OperationType::Custom(operation) if operation == SHELL_EXECUTE_OPERATION => {
+                self.capabilities.shell_execute
+            }
             _ => true,
         }
     }
@@ -903,4 +1082,34 @@ enum CommandTopicError {
 
     #[error("Not a command topic")]
     InvalidCommandTopic,
+}
+
+async fn service_of_device(
+    entity_store: &mut EntityStoreClient,
+    own_device: &EntityTopicId,
+    target: &EntityTopicId,
+) -> Option<EntityType> {
+    match entity_store.get_with_retries(target).await {
+        Ok(Some(entity))
+            if entity.r#type == EntityType::Service
+                && entity.parent.as_ref() == Some(own_device) =>
+        {
+            Some(EntityType::Service)
+        }
+        Ok(Some(entity)) => {
+            debug!(
+                "Ignoring the command addressed to {target}: a {} is not a service of {own_device}",
+                entity.r#type
+            );
+            None
+        }
+        Ok(None) => {
+            info!("Ignoring the command addressed to {target}: no such entity is registered");
+            None
+        }
+        Err(err) => {
+            error!("Not executing the command addressed to {target}, as its registration data cannot be read: {err}");
+            None
+        }
+    }
 }

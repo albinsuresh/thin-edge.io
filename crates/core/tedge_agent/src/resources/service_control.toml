@@ -1,0 +1,52 @@
+operation = "control"
+type = "service"
+
+[init]
+action = "proceed"
+on_success = "executing"
+
+[executing]
+action = "proceed"
+on_success = "evaluate-restart"
+
+[evaluate-restart]
+script = "test ${.payload.action} = restart"
+on_exit.0 = "evaluate-agent-restart"
+on_exit.1-255 = "execute"
+
+# tedge-agent restarts itself: asking the init system would kill it in the middle of this workflow.
+# systemd restarts `tedge-agent.service` and `tedge-agent` alike, and the name comes from the
+# cloud, so both spellings have to reach the self-restart.
+[evaluate-agent-restart]
+script = "test ${.payload.serviceName} = tedge-agent -o ${.payload.serviceName} = tedge-agent.service"
+on_exit.0 = "restart-agent"
+on_exit.1-255 = "execute"
+
+[restart-agent]
+action = "restart-agent"
+on_exec = "await-agent-restart"
+
+[await-agent-restart]
+action = "await-agent-restart"
+timeout_second = 90
+on_success = "successful"
+on_timeout = { status = "failed", reason = "tedge-agent did not restart in time" }
+
+[execute]
+script = "tedge service ${.payload.action} ${.payload.serviceName} --type ${.payload.serviceType}"
+sudo = true
+# Longer than tedge service takes at most to terminate an action on timeout,
+# 240 seconds with its default --timeout and --forceful-timeout,
+# so that tedge service exits with 124 before this workflow kills it
+timeout_second = 300
+on_exit.0 = "successful"
+on_exit.1-123 = { status = "failed", reason = "The action failed, see the operation log for the reason" }
+on_exit.124 = { status = "failed", reason = "The action did not complete in time" }
+on_exit.125-255 = { status = "failed", reason = "The action failed, see the operation log for the reason" }
+on_kill = { status = "failed", reason = "The action did not complete in time and was cancelled" }
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"

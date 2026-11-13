@@ -35,6 +35,7 @@ use tedge_mqtt_bridge::rumqttc::Transport;
 use tedge_mqtt_bridge::use_credentials;
 use tedge_mqtt_bridge::MqttBridgeActorBuilder;
 use tedge_mqtt_bridge::MqttOptions;
+use tedge_supervisor::SupervisorMode;
 use tedge_utils::paths::ManagedDir;
 use tedge_utils::paths::TedgePaths;
 use tedge_watch_ext::WatchActorBuilder;
@@ -68,7 +69,7 @@ impl CustomMapper {
 ///
 /// This is the single authoritative description of what a mapper directory
 /// contains and what components should be started. Produced by
-/// [`validate_and_load`], then used directly to drive [`start`].
+/// [`validate_and_load`], then used directly to drive [`CustomMapper::build`].
 #[derive(Debug)]
 pub enum MapperStartup {
     /// The mapper directory has no `bridge/` subdirectory.
@@ -326,6 +327,7 @@ impl TEdgeComponent for CustomMapper {
         &self,
         tedge_config: TEdgeConfig,
         config_dir: &TedgePaths,
+        supervisor_mode: SupervisorMode,
     ) -> anyhow::Result<Runtime> {
         let mapper_dir = self.mapper_dir(config_dir);
         let service_name = self.service_name();
@@ -333,7 +335,7 @@ impl TEdgeComponent for CustomMapper {
         let startup = validate_and_load(mapper_dir.path(), config_dir.root()).await?;
 
         let (mut runtime, mut mqtt_actor) =
-            start_basic_actors(&service_name, &tedge_config, Vec::new()).await?;
+            start_basic_actors(&service_name, &tedge_config, Vec::new(), supervisor_mode).await?;
 
         if let MapperStartup::WithBridge { ref config, .. } = startup {
             let bridge_dir = mapper_dir.dir("bridge")?;
@@ -914,6 +916,28 @@ AwEHoUQDQgAEdklRDw9+AAMRbpNMWJutKe4QO/tUlvrBR2swUYN9onxXdKNjJ/k3\n\
         }
 
         #[tokio::test]
+        async fn explicit_device_id_used_as_mqtt_client_id_instead_of_cert_cn() {
+            let ttd = TempTedgeDir::new();
+            let mapper_dir = ttd.path().join("mappers/thingsboard");
+            let (cert, key) = write_cert(ttd.path()).await;
+            let tedge_config = TEdgeConfig::load_toml_str(&format!(
+                "device.cert_path = \"{cert}\"\ndevice.key_path = \"{key}\"\n"
+            ));
+            let mut config = make_config(Some("mqtt.example.com:8883"));
+            config.device = Some(DeviceConfig {
+                id: Some("mapper-device".to_string()),
+                ..Default::default()
+            });
+            let effective = resolve(&config, &tedge_config).await;
+
+            let (mqtt_opts, _) =
+                build_cloud_mqtt_options(&effective, "svc", &mapper_dir, &tedge_config)
+                    .await
+                    .unwrap();
+            assert_eq!(mqtt_opts.client_id(), "mapper-device");
+        }
+
+        #[tokio::test]
         async fn password_auth_uses_device_id_as_client_id() {
             let ttd = TempTedgeDir::new();
             let mapper_dir = ttd.path().join("mappers/thingsboard");
@@ -924,9 +948,7 @@ AwEHoUQDQgAEdklRDw9+AAMRbpNMWJutKe4QO/tUlvrBR2swUYN9onxXdKNjJ/k3\n\
             config.credentials_path = Some(creds_path);
             config.device = Some(DeviceConfig {
                 id: Some("mapper-device".to_string()),
-                cert_path: None,
-                key_path: None,
-                root_cert_path: None,
+                ..Default::default()
             });
             let effective = resolve(&config, &tedge_config).await;
 

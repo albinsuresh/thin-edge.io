@@ -6,6 +6,7 @@ pub mod availability;
 pub mod bridge_readiness;
 pub mod config;
 pub mod converter;
+pub mod domain_name_refresh;
 pub mod dynamic_discovery;
 pub mod entity_cache;
 pub mod error;
@@ -16,6 +17,7 @@ mod mea;
 mod operations;
 mod serializer;
 pub mod service_monitor;
+mod shell_execute;
 mod signals;
 mod supported_operations;
 
@@ -33,6 +35,8 @@ pub struct Capabilities {
     pub device_profile: bool,
     pub device_restart: bool,
     pub software_update: bool,
+    pub shell_execute: bool,
+    pub service_control: bool,
 }
 
 #[cfg(test)]
@@ -46,6 +50,8 @@ impl Default for Capabilities {
             device_profile: true,
             device_restart: true,
             software_update: true,
+            shell_execute: true,
+            service_control: true,
         }
     }
 }

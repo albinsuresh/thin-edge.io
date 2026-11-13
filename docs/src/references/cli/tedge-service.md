@@ -7,7 +7,7 @@ sidebar_position: 12
 # The tedge service command
 
 ```text command="tedge service --help" title="tedge service"
-Execute a service command
+Run a control action on a service
 
 Usage: tedge service [OPTIONS] <ACTION> <SERVICE_NAME>
 
@@ -35,6 +35,16 @@ Options:
           Turn-on the DEBUG log level.
           
           If off only reports ERROR, WARN, and INFO, if on also reports DEBUG
+
+      --timeout <TIMEOUT>
+          Timeout for the action to complete, after which a graceful termination starts
+          
+          [default: 180s]
+
+      --forceful-timeout <FORCEFUL_TIMEOUT>
+          Timeout for forced termination, starting after a graceful timeout expires
+          
+          [default: 60s]
 
       --log-level <LOG_LEVEL>
           Configures the logging level.

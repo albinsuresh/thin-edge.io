@@ -12,11 +12,12 @@ members = [
     "plugins/tedge_file_config_plugin",
     "plugins/tedge_file_log_plugin",
     "plugins/tedge_flows_plugin",
+    "plugins/tedge_shell_plugin",
 ]
 resolver = "2"
 
 [workspace.package]
-version = "2.0.1"
+version = "2.1.0"
 authors = ["thin-edge.io team <info@thin-edge.io>"]
 edition = "2021"
 rust-version = "1.92"
@@ -53,6 +54,7 @@ tedge-file-log-plugin = { path = "plugins/tedge_file_log_plugin" }
 tedge-flows-plugin = { path = "plugins/tedge_flows_plugin" }
 tedge-mapper = { path = "crates/core/tedge_mapper", default-features = false }
 tedge-p11 = { path = "crates/common/tedge-p11" }
+tedge-shell-plugin = { path = "plugins/tedge_shell_plugin" }
 tedge-watchdog = { path = "crates/core/tedge_watchdog" }
 tedge-write = { path = "crates/core/tedge_write" }
 tedge_actors = { path = "crates/core/tedge_actors" }
@@ -71,6 +73,7 @@ tedge_flows = { path = "crates/extensions/tedge_flows" }
 tedge_health_ext = { path = "crates/extensions/tedge_health_ext" }
 tedge_http_ext = { path = "crates/extensions/tedge_http_ext" }
 tedge_log_manager = { path = "crates/extensions/tedge_log_manager" }
+tedge_mapper_config = { path = "crates/common/tedge_mapper_config" }
 tedge_mqtt_bridge = { path = "crates/extensions/tedge_mqtt_bridge" }
 tedge_mqtt_ext = { path = "crates/extensions/tedge_mqtt_ext" }
 tedge_script_ext = { path = "crates/extensions/tedge_script_ext" }
@@ -98,7 +101,6 @@ async-http-proxy = { version = "1.2", features = [
     "runtime-tokio",
     "basic-auth",
 ] }
-async-tempfile = "0.7"
 async-trait = "0.1"
 async-tungstenite = { version = "0.29.1", features = [
     "tokio-runtime",
@@ -127,11 +129,11 @@ darling = "0.21"
 doku = "0.21"
 easy_reader = "0.5"
 env_logger = "0.11"
-facet = { version = "0.50.0-rc.5", features = ["camino", "net", "nonzero"] }
-facet-json = "0.50.0-rc.5"
-facet-reflect = "0.50.0-rc.5"
-facet-toml = "0.50.0-rc.5"
-facet-value = "0.50.0-rc.5"
+facet = { version = "0.50.0-rc.7", features = ["camino", "net", "nonzero"] }
+facet-json = "0.50.0-rc.7"
+facet-reflect = "0.50.0-rc.7"
+facet-toml = "0.50.0-rc.7"
+facet-value = "0.50.0-rc.7"
 fastrand = "2.0"
 figment = { version = "0.10" }
 filetime = "0.2"
@@ -165,6 +167,7 @@ mime_guess = "2.0.4"
 mockall = "0.14"
 mockito = "1.1.0"
 mqttbytes = "0.6"
+multistream-select = "0.14"
 mutants = "0.0.3"
 nanoid = "0.4"
 nix = { version = "0.30", default-features = false, features = [
@@ -195,7 +198,7 @@ rcgen = { version = "0.14", features = ["pem", "zeroize"] }
 regex = "1.4"
 reqwest = { version = "0.12", default-features = false }
 ron = "0.12"
-rpassword = "7.4"
+rpassword = "7.5"
 rsa = "0.9.10"
 rstest = "0.26"
 rumqttc = { git = "https://github.com/didier-wenzek/rumqtt", branch = "chore/upgrade-rustls-webpki", default-features = false, features = [
@@ -251,6 +254,7 @@ which = "8.0"
 whoami = "1.5.0"
 ws_stream_tungstenite = "0.15.0"
 x509-parser = "0.18"
+yamux = "0.14"
 yansi = { version = "1.0.1", default-features = false, features = [
     "detect-env",
     "detect-tty",
@@ -275,3 +279,4 @@ uninlined_format_args = "allow"
 
 [workspace.lints.rust]
 rust_2024_incompatible_pat = "deny"
+unsafe_code = "deny"

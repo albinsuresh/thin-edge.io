@@ -46,6 +46,13 @@ pub trait SystemServiceManager: Debug + Send + Sync {
     /// Checks whether the system service manager facility is available and operational.
     async fn check_operational(&self) -> Result<(), SystemServiceError>;
 
+    /// Returns the command of an action defined in `system.toml` for the given service, without running it.
+    fn action_command(
+        &self,
+        action: &str,
+        service: SystemService<'_>,
+    ) -> Result<ExecCommand, SystemServiceError>;
+
     /// Runs an action defined in `system.toml` on the given service.
     async fn run_action(
         &self,
@@ -83,6 +90,14 @@ pub trait SystemServiceManager: Debug + Send + Sync {
         &self,
         service: SystemService<'_>,
     ) -> Result<bool, SystemServiceError>;
+
+    /// Returns true when the given executable is found on the `PATH`
+    async fn has_executable(&self, executable: &str) -> bool {
+        let executable = executable.to_owned();
+        tokio::task::spawn_blocking(move || which::which(executable).is_ok())
+            .await
+            .unwrap_or(false)
+    }
 }
 
 pub fn service_manager(
