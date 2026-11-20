@@ -1,3 +1,5 @@
+#![allow(unreachable_code)]
+
 mod version;
 use futures::Stream;
 use reqwest::NoProxy;
@@ -67,8 +69,9 @@ use std::net::Ipv4Addr;
 use std::num::NonZeroU16;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tedge_api::file_transfer_url::FileTransferUrls;
-use tedge_api::file_transfer_url::Protocol;
+use tedge_api::http_url::EntityStoreUrls;
+use tedge_api::http_url::FileTransferUrls;
+use tedge_api::http_url::Protocol;
 use tedge_api::mqtt_topics::EntityTopicId;
 pub use tedge_config_macros::ConfigNotSet;
 pub use tedge_config_macros::MultiError;
@@ -749,6 +752,16 @@ define_tedge_config! {
             #[tedge_config(example = "true", default(value = true))]
             #[tedge_config(exposable)]
             software_update: bool,
+
+            /// Enable shell execute feature
+            #[tedge_config(example = "true", default(value = true))]
+            #[tedge_config(exposable)]
+            shell_execute: bool,
+
+            /// Enable service control feature
+            #[tedge_config(example = "true", default(value = true))]
+            #[tedge_config(exposable)]
+            service_control: bool,
         },
 
         mapper: {
@@ -1301,6 +1314,11 @@ define_tedge_config! {
             #[tedge_config(example = "true", default(value = true))]
             #[tedge_config(exposable)]
             log_upload: bool,
+
+            /// Determines if tedge-agent should enable shell_execute operation
+            #[tedge_config(example = "true", default(value = true))]
+            #[tedge_config(exposable)]
+            shell_execute: bool,
         },
 
         entity_store: {
@@ -1464,6 +1482,26 @@ define_tedge_config! {
         /// The directories where configuration plugins are stored
         #[tedge_config(example = "/usr/share/tedge/config-plugins,/usr/local/share/tedge/config-plugins", default(value = "/usr/share/tedge/config-plugins"))]
         plugin_paths: TemplatesSet,
+    },
+
+    shell: {
+        /// The shell used by the `shell_execute` operation to run the commands
+        #[tedge_config(example = "/bin/sh", example = "/bin/bash", default(from_str = "/bin/sh"))]
+        #[tedge_config(exposable)]
+        path: AbsolutePath,
+
+        /// The maximum number of bytes of command output stored and reported by the `shell_execute`
+        /// operation. Any output beyond that limit is discarded, the command still running to completion
+        #[tedge_config(example = "15000", default(value = 15000u32))]
+        #[tedge_config(exposable)]
+        max_output_size: u32,
+
+        /// The maximum duration of a command run by the `shell_execute` operation.
+        /// A command still running after that duration is terminated, along with
+        /// the processes it started, and the operation fails
+        #[tedge_config(example = "10m", example = "60s", default(from_str = "10m"))]
+        #[tedge_config(exposable)]
+        timeout: SecondsOrHumanTime,
     },
 
     flows: {
@@ -1887,13 +1925,23 @@ impl TEdgeConfigReaderHttp {
     /// Builds the URLs at which the File Transfer Service HTTP server exposes files,
     /// as seen by a client connecting to `http.client.host:http.client.port`.
     pub fn file_transfer_urls(&self) -> FileTransferUrls {
-        let authority: Arc<str> = format!("{}:{}", self.client.host, self.client.port).into();
+        let (authority, protocol) = self.client_authority();
+        FileTransferUrls::new(authority, protocol)
+    }
+
+    pub fn entity_store_urls(&self) -> EntityStoreUrls {
+        let (authority, protocol) = self.client_authority();
+        EntityStoreUrls::new(authority, protocol)
+    }
+
+    fn client_authority(&self) -> (Arc<str>, Protocol) {
+        let authority = format!("{}:{}", self.client.host, self.client.port).into();
         let protocol = if self.is_secure() {
             Protocol::Https
         } else {
             Protocol::Http
         };
-        FileTransferUrls::new(authority, protocol)
+        (authority, protocol)
     }
 }
 

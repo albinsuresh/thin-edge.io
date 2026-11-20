@@ -64,7 +64,11 @@ auth_method = "auto"
 # credentials_path = "credentials.toml"
 
 [device]
-# MQTT client ID (defaults to the certificate CN if not set)
+# MQTT client ID.
+# Overrides the certificate CN, so mappers whose certificates share a CN
+# can connect to the same broker with distinct client IDs.
+# When not set, certificate auth uses the certificate CN, then tedge.toml device.id,
+# and password auth uses tedge.toml device.id.
 # id = "my-device"
 
 # Client certificate for mutual TLS.
@@ -84,10 +88,10 @@ clean_session = false
 # MQTT keepalive interval (e.g. "60s", "2m")
 # keepalive_interval = "60s"
 
-# TLS transport control: "auto" (default), "on", or "off".
+# TLS transport control: "auto" (default), "true", or "false".
 # auto: infer from port (8883 → TLS on, 1883 → TLS off, other → TLS on)
-# on: always use TLS regardless of port
-# off: never use TLS (plain TCP, incompatible with certificate authentication)
+# true: always use TLS regardless of port
+# false: never use TLS (plain TCP, incompatible with certificate authentication)
 # tls.enable = "auto"
 
 # Maximum MQTT packet size (in bytes) the bridge forwards to the cloud.

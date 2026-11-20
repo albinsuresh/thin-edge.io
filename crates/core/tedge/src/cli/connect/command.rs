@@ -8,8 +8,10 @@ use crate::bridge::BridgeConfig;
 use crate::bridge::BridgeLocation;
 use crate::bridge::CommonMosquittoConfig;
 use crate::bridge::TEDGE_BRIDGE_CONF_DIR_PATH;
+use crate::cli::common::is_run_all_active;
 use crate::cli::common::Cloud;
 use crate::cli::common::MaybeBorrowedCloud;
+use crate::cli::common::RUN_ALL_SERVICE;
 #[cfg(feature = "c8y")]
 use crate::cli::connect::c8y::*;
 use crate::cli::connect::*;
@@ -23,6 +25,8 @@ use crate::warning;
 use crate::ConfigError;
 use anyhow::anyhow;
 use anyhow::bail;
+#[cfg(feature = "c8y")]
+use c8y_api::domain_names::DomainNames;
 #[cfg(feature = "c8y")]
 use c8y_api::http_proxy::read_c8y_credentials;
 use camino::Utf8PathBuf;
@@ -254,10 +258,13 @@ impl ConnectCommand {
             Err(err) => return Err(err),
         }
 
+        // When the components run inside `tedge run all`, the per-component services are not used
+        let run_all = is_run_all_active(&*self.service_manager).await;
+
         if bridge_config.use_mapper && bridge_config.bridge_location == BridgeLocation::BuiltIn {
             // If the bridge is built in, the mapper needs to be running with the new configuration
             // to be connected
-            self.start_mapper().await;
+            self.start_mapper(run_all).await;
         }
 
         let mut connection_check_success = true;
@@ -283,7 +290,7 @@ impl ConnectCommand {
         if bridge_config.use_mapper && bridge_config.bridge_location == BridgeLocation::Mosquitto {
             // If the bridge is in mosquitto, the mapper should only start once the cloud connection
             // is verified
-            self.start_mapper().await;
+            self.start_mapper(run_all).await;
         }
 
         match &self.cloud {
@@ -294,7 +301,10 @@ impl ConnectCommand {
                         .tenant_matches_configured_url(tedge_config, bridge_config)
                         .await;
                 }
-                enable_software_management(bridge_config, &*self.service_manager).await;
+                // Under `tedge run all`, the agent runs in the process restarted with the mapper
+                if !run_all {
+                    enable_software_management(bridge_config, &*self.service_manager).await;
+                }
             }
             #[cfg(feature = "aws")]
             Cloud::Aws(_) => (),
@@ -539,8 +549,19 @@ impl ConnectCommand {
         path_exists(&bridge_conf_path).await
     }
 
-    async fn start_mapper(&self) {
-        if which_async("tedge-mapper").await.is_err() {
+    async fn start_mapper(&self, run_all: bool) {
+        if run_all {
+            // `tedge run all` selects and configures its mappers when it starts,
+            // so the whole process has to be restarted to apply the new connection
+            let spinner = Spinner::start(format!("Restarting {RUN_ALL_SERVICE} (tedge run all)"));
+            let _ = spinner.finish(
+                restart_and_enable_service(
+                    &*self.service_manager,
+                    SystemService::new(RUN_ALL_SERVICE),
+                )
+                .await,
+            );
+        } else if !self.service_manager.has_executable("tedge-mapper").await {
             warning!("tedge-mapper is not installed.");
         } else {
             let spinner = Spinner::start(format!("Enabling {}", self.cloud.mapper_service()));
@@ -1229,7 +1250,7 @@ async fn enable_software_management(
     service_manager: &dyn SystemServiceManager,
 ) {
     if bridge_config.use_agent {
-        if which_async("tedge-agent").await.is_ok() {
+        if service_manager.has_executable("tedge-agent").await {
             let spinner = Spinner::start("Enabling tedge-agent");
             let _ = spinner.finish(
                 start_and_enable_service(service_manager, SystemService::new("tedge-agent")).await,
@@ -1240,17 +1261,20 @@ async fn enable_software_management(
     }
 }
 
-async fn which_async(name: &'static str) -> Result<std::path::PathBuf, which::Error> {
-    tokio::task::spawn_blocking(move || ::which::which(name))
-        .await
-        .unwrap()
-}
-
 async fn start_and_enable_service(
     service_manager: &dyn SystemServiceManager,
     service: SystemService<'_>,
 ) -> anyhow::Result<()> {
     service_manager.start_service(service).await?;
+    service_manager.enable_service(service).await?;
+    Ok(())
+}
+
+async fn restart_and_enable_service(
+    service_manager: &dyn SystemServiceManager,
+    service: SystemService<'_>,
+) -> anyhow::Result<()> {
+    service_manager.restart_service(service).await?;
     service_manager.enable_service(service).await?;
     Ok(())
 }
@@ -1334,10 +1358,23 @@ async fn tenant_matches_configured_url(
 ) -> Result<bool, Fancy<ConnectError>> {
     let spinner = Spinner::start("Checking Cumulocity is connected to intended tenant");
     let c8y_config = tedge_config.mapper_config::<C8yMapperSpecificConfig>(&profile_name)?;
-    let res = get_connected_c8y_url(tedge_config, &c8y_config).await;
+    let res = async {
+        let url = get_connected_c8y_url(tedge_config, &c8y_config).await?;
+        let matches = url == configured_mqtt_url
+            || url == configured_http_url
+            || is_configured_tenant_on_another_domain(
+                tedge_config,
+                &c8y_config,
+                configured_http_url,
+                &url,
+            )
+            .await;
+        Ok((url, matches))
+    }
+    .await;
     match spinner.finish(res) {
-        Ok(url) if url == configured_mqtt_url || url == configured_http_url => Ok(true),
-        Ok(url) => {
+        Ok((_, true)) => Ok(true),
+        Ok((url, false)) => {
             warning!(
             "The device is connected to {}, but the configured URL is (mqtt={}, http={}).\
             \n    To connect the device to the intended tenant, remove the device certificate from {url}, and then run `tedge reconnect c8y`", 
@@ -1351,10 +1388,163 @@ async fn tenant_matches_configured_url(
     }
 }
 
+// The tenant can be reachable under several domains, e.g. while a dedicated instance is renamed,
+// in which case the device is connected to the configured tenant under its new domain.
+#[cfg(feature = "c8y")]
+async fn is_configured_tenant_on_another_domain(
+    tedge_config: &TEdgeConfig,
+    c8y_config: &MapperConfig<C8yMapperSpecificConfig>,
+    configured_http_url: &str,
+    connected_url: &str,
+) -> bool {
+    let domain_names = async {
+        let c8y_http = c8y_config.http().or_config_not_set()?;
+        let http_config = tedge_config.cloud_root_certs().await?;
+        anyhow::Ok(DomainNames::detect(&c8y_http.to_string(), &http_config).await?)
+    };
+    match domain_names.await {
+        Ok(domain_names) => {
+            domain_names.is_same_tenant_on_another_domain(configured_http_url, connected_url)
+        }
+        Err(err) => {
+            tracing::debug!(
+                "Failed to detect the Cumulocity tenant domain names for the tenant check: {err:#}"
+            );
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mqtt_channel::QoS::AtLeastOnce;
+
+    #[cfg(feature = "c8y")]
+    mod start_mapper {
+        use super::*;
+        use crate::cli::common::test_service_manager::RecordingServiceManager;
+        use tedge_test_utils::fs::TempTedgeDir;
+
+        #[tokio::test]
+        async fn run_all_restarts_and_enables_only_the_tedge_service() {
+            let manager = Arc::new(RecordingServiceManager::with_active(&["tedge"]));
+            let cmd = connect_command(manager.clone());
+
+            cmd.start_mapper(true).await;
+
+            assert_eq!(manager.actions(), ["restart tedge", "enable tedge"]);
+        }
+
+        #[tokio::test]
+        async fn starts_and_enables_the_mapper_service_when_tedge_mapper_is_installed() {
+            let manager = Arc::new(
+                RecordingServiceManager::with_active(&[]).with_installed(&["tedge-mapper"]),
+            );
+            let cmd = connect_command(manager.clone());
+
+            cmd.start_mapper(false).await;
+
+            assert_eq!(
+                manager.actions(),
+                ["start tedge-mapper-c8y", "enable tedge-mapper-c8y"]
+            );
+        }
+
+        #[tokio::test]
+        async fn leaves_the_mapper_service_alone_when_tedge_mapper_is_not_installed() {
+            let manager = Arc::new(RecordingServiceManager::with_active(&[]));
+            let cmd = connect_command(manager.clone());
+
+            cmd.start_mapper(false).await;
+
+            assert!(manager.actions().is_empty());
+        }
+
+        #[tokio::test]
+        async fn connecting_under_run_all_restarts_tedge_instead_of_the_component_services() {
+            let ttd = TempTedgeDir::new();
+            let config = c8y_config(&ttd).await;
+            let manager = Arc::new(
+                RecordingServiceManager::with_active(&["tedge"]).with_installed(&["tedge-agent"]),
+            );
+            let mut cmd = connect_command(manager.clone());
+            cmd.offline_mode = true;
+            let bridge_config = bridge_config(&config, &cmd.cloud).await.unwrap();
+
+            cmd.connect_bridge(&config, &bridge_config).await.unwrap();
+
+            assert_eq!(
+                manager.actions(),
+                [
+                    "stop mosquitto",
+                    "restart mosquitto",
+                    "enable mosquitto",
+                    "restart tedge",
+                    "enable tedge"
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn connecting_without_run_all_starts_and_enables_the_mapper_and_the_agent() {
+            let ttd = TempTedgeDir::new();
+            let config = c8y_config(&ttd).await;
+            let manager = Arc::new(
+                RecordingServiceManager::with_active(&[])
+                    .with_installed(&["tedge-mapper", "tedge-agent"]),
+            );
+            let mut cmd = connect_command(manager.clone());
+            cmd.offline_mode = true;
+            let bridge_config = bridge_config(&config, &cmd.cloud).await.unwrap();
+
+            cmd.connect_bridge(&config, &bridge_config).await.unwrap();
+
+            assert_eq!(
+                manager.actions(),
+                [
+                    "stop mosquitto",
+                    "restart mosquitto",
+                    "enable mosquitto",
+                    "start tedge-mapper-c8y",
+                    "enable tedge-mapper-c8y",
+                    "start tedge-agent",
+                    "enable tedge-agent"
+                ]
+            );
+        }
+
+        async fn c8y_config(ttd: &TempTedgeDir) -> TEdgeConfig {
+            let cert = rcgen::generate_simple_self_signed(["test-device".into()]).unwrap();
+            let cert_path = ttd
+                .file("test.crt")
+                .with_raw_content(&cert.cert.pem())
+                .path_buf();
+            let key_path = ttd
+                .file("test.key")
+                .with_raw_content(&cert.signing_key.serialize_pem())
+                .path_buf();
+            // An empty user and group keep the config files owned by the current user
+            ttd.file("system.toml")
+                .with_raw_content("user = ''\ngroup = ''\n");
+            ttd.file("tedge.toml").with_raw_content(&format!(
+                "c8y.url = \"example.com\"
+                c8y.device.cert_path = \"{cert_path}\"
+                c8y.device.key_path = \"{key_path}\""
+            ));
+            TEdgeConfig::load(ttd.path()).await.unwrap()
+        }
+
+        fn connect_command(service_manager: Arc<RecordingServiceManager>) -> ConnectCommand {
+            ConnectCommand {
+                cloud: Cloud::c8y(None),
+                is_test_connection: false,
+                offline_mode: false,
+                service_manager,
+                is_reconnect: true,
+            }
+        }
+    }
 
     mod is_bridge_health_up_message {
         use super::*;

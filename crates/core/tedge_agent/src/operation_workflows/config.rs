@@ -2,6 +2,7 @@ use crate::Capabilities;
 use tedge_api::mqtt_topics::EntityTopicId;
 use tedge_api::mqtt_topics::MqttSchema;
 use tedge_api::workflow::log::log_dir::OperationLogs;
+use tedge_config::SudoCommandBuilder;
 use tedge_config::TEdgeConfig;
 use tedge_utils::paths::ManagedDir;
 use tedge_utils::paths::TedgePaths;
@@ -17,6 +18,7 @@ pub struct OperationConfig {
     pub operations_dir: ManagedDir,
     pub tmp_dir: TedgePaths,
     pub capabilities: Capabilities,
+    pub sudo: SudoCommandBuilder,
 }
 
 impl OperationConfig {
@@ -31,6 +33,7 @@ impl OperationConfig {
             config_update: tedge_config.agent.enable.config_update,
             config_snapshot: tedge_config.agent.enable.config_snapshot,
             log_upload: tedge_config.agent.enable.log_upload,
+            shell_execute: tedge_config.agent.enable.shell_execute,
         };
         let log_dir = tedge_config.operation_logs();
 
@@ -44,6 +47,7 @@ impl OperationConfig {
             operations_dir: config_dir.dir("operations")?,
             tmp_dir: tedge_config.tmp_root(),
             capabilities,
+            sudo: SudoCommandBuilder::new(tedge_config),
         })
     }
 }

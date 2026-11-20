@@ -1,4 +1,6 @@
+use crate::cli::common::is_run_all_active;
 use crate::cli::common::Cloud;
+use crate::cli::common::RUN_ALL_SERVICE;
 use crate::cli::disconnect::error::*;
 use crate::cli::log::Fancy;
 use crate::cli::log::Spinner;
@@ -9,7 +11,6 @@ use camino::Utf8PathBuf;
 use std::sync::Arc;
 use tedge_config::TEdgeConfig;
 use tedge_system_services::*;
-use which::which;
 
 const TEDGE_BRIDGE_CONF_DIR_PATH: &str = "mosquitto-conf";
 
@@ -80,11 +81,24 @@ impl DisconnectBridgeCommand {
         let _ = self.apply_changes_to_mosquitto().await;
 
         // Only C8Y changes the status of tedge-mapper
-        if self.use_mapper && which("tedge-mapper").is_ok() {
+        if self.use_mapper {
+            self.disable_mapper().await?;
+        }
+
+        Ok(())
+    }
+
+    async fn disable_mapper(&self) -> Result<(), Fancy<DisconnectBridgeError>> {
+        if is_run_all_active(&*self.service_manager).await {
+            // Stopping the service would also stop the agent and the other mappers
+            println!(
+                "Info: {} runs inside {RUN_ALL_SERVICE} (tedge run all); not disabling it.",
+                self.cloud.mapper_service()
+            );
+        } else if self.service_manager.has_executable("tedge-mapper").await {
             let spinner = Spinner::start(format!("Disabling {}", self.cloud.mapper_service()));
             spinner.finish(self.stop_and_disable_mapper().await)?;
         }
-
         Ok(())
     }
 
@@ -168,5 +182,83 @@ async fn restart_service_if_running(
         Ok(true)
     } else {
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "c8y")]
+mod tests {
+    use super::*;
+    use crate::cli::common::test_service_manager::RecordingServiceManager;
+    use tedge_test_utils::fs::TempTedgeDir;
+
+    #[tokio::test]
+    async fn run_all_leaves_the_services_alone() {
+        let manager = Arc::new(RecordingServiceManager::with_active(&["tedge"]));
+        let cmd = DisconnectBridgeCommand {
+            config_dir: Utf8PathBuf::from("/etc/tedge"),
+            cloud: Cloud::c8y(None),
+            use_mapper: true,
+            service_manager: manager.clone(),
+        };
+
+        cmd.disable_mapper().await.unwrap();
+
+        assert!(manager.actions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn stops_and_disables_the_mapper_service_when_tedge_mapper_is_installed() {
+        let manager =
+            Arc::new(RecordingServiceManager::with_active(&[]).with_installed(&["tedge-mapper"]));
+        let cmd = DisconnectBridgeCommand {
+            config_dir: Utf8PathBuf::from("/etc/tedge"),
+            cloud: Cloud::c8y(None),
+            use_mapper: true,
+            service_manager: manager.clone(),
+        };
+
+        cmd.disable_mapper().await.unwrap();
+
+        assert_eq!(
+            manager.actions(),
+            ["stop tedge-mapper-c8y", "disable tedge-mapper-c8y"]
+        );
+    }
+
+    #[tokio::test]
+    async fn leaves_the_mapper_service_alone_when_tedge_mapper_is_not_installed() {
+        let manager = Arc::new(RecordingServiceManager::with_active(&[]));
+        let cmd = DisconnectBridgeCommand {
+            config_dir: Utf8PathBuf::from("/etc/tedge"),
+            cloud: Cloud::c8y(None),
+            use_mapper: true,
+            service_manager: manager.clone(),
+        };
+
+        cmd.disable_mapper().await.unwrap();
+
+        assert!(manager.actions().is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnecting_under_run_all_removes_the_bridge_and_restarts_only_mosquitto() {
+        let ttd = TempTedgeDir::new();
+        let bridge_file = ttd.dir("mosquitto-conf").file("c8y-bridge.conf");
+        let manager = Arc::new(RecordingServiceManager::with_active(&[
+            "mosquitto",
+            "tedge",
+        ]));
+        let cmd = DisconnectBridgeCommand {
+            config_dir: ttd.path_buf(),
+            cloud: Cloud::c8y(None),
+            use_mapper: true,
+            service_manager: manager.clone(),
+        };
+
+        cmd.stop_bridge().await.unwrap();
+
+        assert!(!bridge_file.path().exists());
+        assert_eq!(manager.actions(), ["restart mosquitto"]);
     }
 }

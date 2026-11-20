@@ -3,20 +3,35 @@ use crate::command::Command;
 use crate::log::MaybeFancy;
 use camino::Utf8Path;
 use camino::Utf8PathBuf;
-use std::process::Stdio;
-use tedge_api::service_command::ActionName;
-use tedge_api::service_command::ServiceName;
-use tedge_api::service_command::ServiceType;
-use tedge_api::service_command::DEFAULT_SERVICE_TYPE;
+use clap_complete::ArgValueCandidates;
+use clap_complete::CompletionCandidate;
+use std::collections::BTreeSet;
+use std::path::Path;
+use std::process::Output;
+use std::time::Duration;
+use tedge_api::control::ActionName;
+use tedge_api::control::ServiceName;
+use tedge_api::control::ServiceType;
+use tedge_api::control::DEFAULT_SERVICE_TYPE;
+use tedge_api::workflow::log::logged_command::CmdStatus;
 use tedge_api::workflow::BEGIN_TEDGE_MARKER;
 use tedge_api::workflow::END_TEDGE_MARKER;
+use tedge_api::LoggedCommand;
+use tedge_config::get_config_dir;
+use tedge_config::models::SecondsOrHumanTime;
+use tedge_config::SystemConfig;
 use tedge_config::TEdgeConfig;
+use tedge_config::SYSTEM_CONFIG_FILE;
 use tedge_system_services::service_manager;
 use tedge_system_services::SystemService;
 use tedge_system_services::SystemServiceError;
+use tedge_utils::signals::TermSignals;
 
 /// The exit code of an action that is not supported for the service type
 const NOT_SUPPORTED_EXIT_CODE: i32 = 2;
+
+/// The exit code of an action terminated on timeout, as used by the `timeout` utility
+const TIMEOUT_EXIT_CODE: i32 = 124;
 
 #[derive(clap::Args, Debug, Eq, PartialEq)]
 pub struct TEdgeServiceOpt {
@@ -24,6 +39,7 @@ pub struct TEdgeServiceOpt {
     ///
     /// Which actions are supported is decided depending on the service type.
     /// Init system for the default service type, a service plugin for any other type.
+    #[arg(add(ArgValueCandidates::new(action_completions)))]
     action: ActionName,
 
     /// The name of the service to act on
@@ -34,7 +50,18 @@ pub struct TEdgeServiceOpt {
     /// The default type is handled by the init system configured in system.toml.
     /// Any other type is handled by the service plugin.
     #[clap(long("type"), default_value = DEFAULT_SERVICE_TYPE)]
+    #[arg(add(ArgValueCandidates::new(service_type_completions)))]
     service_type: ServiceType,
+
+    /// Timeout for the action to complete, after which a graceful termination starts
+    // The default covers a restart by systemd,
+    // which waits up to 90 seconds to stop a service and up to 90 seconds to start it
+    #[clap(long, default_value = "180s")]
+    timeout: SecondsOrHumanTime,
+
+    /// Timeout for forced termination, starting after a graceful timeout expires
+    #[clap(long, default_value = "60s")]
+    forceful_timeout: SecondsOrHumanTime,
 }
 
 #[async_trait::async_trait]
@@ -54,6 +81,8 @@ impl BuildCommand for TEdgeServiceOpt {
                 .iter()
                 .map(Utf8PathBuf::from)
                 .collect(),
+            graceful_timeout: self.timeout.duration(),
+            forceful_timeout: self.forceful_timeout.duration(),
         }
         .into_boxed())
     }
@@ -65,6 +94,8 @@ pub struct ServiceActionCommand {
     service_name: ServiceName,
     service_type: ServiceType,
     plugin_paths: Vec<Utf8PathBuf>,
+    graceful_timeout: Duration,
+    forceful_timeout: Duration,
 }
 
 #[async_trait::async_trait]
@@ -82,6 +113,10 @@ impl Command for ServiceActionCommand {
             Err(ServiceActionError::NotSupported(reason)) => {
                 eprintln!("Error: {reason}");
                 std::process::exit(NOT_SUPPORTED_EXIT_CODE)
+            }
+            Err(err) if err.is_timeout() => {
+                eprintln!("Error: {err}");
+                std::process::exit(TIMEOUT_EXIT_CODE)
             }
             Err(err) => Err(MaybeFancy::Unfancy(err.into())),
         }
@@ -104,10 +139,8 @@ impl ServiceActionCommand {
         let service_manager = service_manager(config_root)?;
         let service = SystemService::new(self.service_name.as_str());
 
-        let outcome = service_manager
-            .run_action(self.action.as_str(), service)
-            .await
-            // Any error occurred before running a process
+        let exec_command = service_manager
+            .action_command(self.action.as_str(), service)
             .map_err(|err| match err {
                 err @ (SystemServiceError::UnsupportedAction { .. }
                 | SystemServiceError::NotAnAction { .. }) => {
@@ -115,15 +148,31 @@ impl ServiceActionCommand {
                 }
                 err => err.into(),
             })?;
+        let service_command = exec_command.to_string();
 
-        forward_output(&outcome.stdout, &outcome.stderr);
+        let command = LoggedCommand::from_command(exec_command.to_command(), ".");
+        let output = match self.execute_with_timeout(command).await {
+            Ok(output) => output,
+            Err(ExecutionError::NotStarted(_)) => {
+                return Err(SystemServiceError::ServiceCommandNotFound {
+                    service_command,
+                    path: config_root.join(SYSTEM_CONFIG_FILE).to_string(),
+                }
+                .into())
+            }
+            Err(ExecutionError::Terminated(termination)) => {
+                return Err(ServiceActionError::InitSystemTerminated {
+                    service_command,
+                    termination,
+                })
+            }
+        };
 
-        if outcome.success() {
+        if output.status.success() {
             return Ok(());
         }
 
-        let service_command = outcome.service_command;
-        match outcome.status.code() {
+        match output.status.code() {
             Some(code) => Err(ServiceActionError::InitSystemFailed {
                 service_command,
                 code,
@@ -135,26 +184,25 @@ impl ServiceActionCommand {
     async fn run_plugin_action(&self) -> Result<(), ServiceActionError> {
         let plugin = self.find_plugin().await?;
 
-        let output = tokio::process::Command::new(&plugin)
+        let mut command = LoggedCommand::from_command(std::process::Command::new(&plugin), ".");
+        command
             .arg(self.action.as_str())
-            .arg(self.service_name.as_str())
-            .stdin(Stdio::null())
-            .output()
-            .await;
-
-        let output = match output {
+            .arg(self.service_name.as_str());
+        let output = match self.execute_with_timeout(command).await {
             Ok(output) => output,
-            Err(err) => {
+            Err(ExecutionError::NotStarted(err)) => {
                 return Err(ServiceActionError::PluginNotExecutable {
                     plugin,
                     source: err,
                 })
             }
+            Err(ExecutionError::Terminated(termination)) => {
+                return Err(ServiceActionError::PluginTerminated {
+                    plugin,
+                    termination,
+                })
+            }
         };
-
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        forward_output(&stdout, &stderr);
 
         match output.status.code() {
             Some(0) => Ok(()),
@@ -167,6 +215,40 @@ impl ServiceActionCommand {
             Some(code) => Err(ServiceActionError::PluginFailed { plugin, code }),
             None => Err(ServiceActionError::PluginKilled { plugin }),
         }
+    }
+
+    /// Runs the command of an action, terminating it on timeout or when this process receives SIGINT, SIGTERM or SIGQUIT
+    async fn execute_with_timeout(
+        &self,
+        mut command: LoggedCommand,
+    ) -> Result<Output, ExecutionError> {
+        // The command runs in a process group of its own, which a Ctrl-C on the terminal does not reach.
+        // The signals are caught before spawning the command, so that none can leave it running.
+        let mut signals = TermSignals::new(None);
+        let child = command.spawn().map_err(ExecutionError::NotStarted)?;
+        let interrupted = async move {
+            let _ = signals.might_interrupt(std::future::pending::<()>()).await;
+        };
+
+        let (output, status) = child
+            .wait_for_output_or_terminate(self.graceful_timeout, self.forceful_timeout, interrupted)
+            .await
+            .map_err(|_| ExecutionError::Terminated(Termination::NotStopped))?;
+
+        forward_output(&output);
+
+        let termination = match status {
+            CmdStatus::Successful => return Ok(output),
+            CmdStatus::KilledWithSigterm => Termination::Timeout {
+                timeout: self.graceful_timeout,
+            },
+            CmdStatus::KilledWithSigKill => Termination::KilledOnTimeout {
+                timeout: self.graceful_timeout,
+                forceful_timeout: self.forceful_timeout,
+            },
+            CmdStatus::KilledWithInterrupt => Termination::Interrupted,
+        };
+        Err(ExecutionError::Terminated(termination))
     }
 
     /// Returns the first plugin file found in the configured plugin paths for the service type.
@@ -190,6 +272,38 @@ impl ServiceActionCommand {
     }
 }
 
+/// The failure of `execute_with_timeout`, which each caller reports with its own `ServiceActionError`
+enum ExecutionError {
+    NotStarted(std::io::Error),
+    Terminated(Termination),
+}
+
+/// How the command of an action was terminated before it completed
+#[derive(Debug, thiserror::Error)]
+enum Termination {
+    #[error(
+        "did not complete within {} and was stopped with SIGTERM",
+        humantime::format_duration(*.timeout)
+    )]
+    Timeout { timeout: Duration },
+
+    #[error(
+        "did not complete within {} and did not stop within {} after SIGTERM, so it was killed with SIGKILL",
+        humantime::format_duration(*.timeout),
+        humantime::format_duration(*.forceful_timeout)
+    )]
+    KilledOnTimeout {
+        timeout: Duration,
+        forceful_timeout: Duration,
+    },
+
+    #[error("did not complete and could not be stopped")]
+    NotStopped,
+
+    #[error("was interrupted")]
+    Interrupted,
+}
+
 #[derive(Debug, thiserror::Error)]
 enum ServiceActionError {
     #[error("{0}")]
@@ -203,6 +317,12 @@ enum ServiceActionError {
 
     #[error("The init system command <{service_command}> was killed by a signal")]
     InitSystemKilled { service_command: String },
+
+    #[error("The init system command <{service_command}> {termination}")]
+    InitSystemTerminated {
+        service_command: String,
+        termination: Termination,
+    },
 
     #[error(transparent)]
     SystemToml(#[from] tedge_config::SystemTomlError),
@@ -219,6 +339,23 @@ enum ServiceActionError {
 
     #[error("The service plugin {plugin} was killed by a signal")]
     PluginKilled { plugin: Utf8PathBuf },
+
+    #[error("The service plugin {plugin} {termination}")]
+    PluginTerminated {
+        plugin: Utf8PathBuf,
+        termination: Termination,
+    },
+}
+
+impl ServiceActionError {
+    fn is_timeout(&self) -> bool {
+        matches!(
+            self,
+            ServiceActionError::InitSystemTerminated { termination, .. }
+            | ServiceActionError::PluginTerminated { termination, .. }
+                if !matches!(termination, Termination::Interrupted)
+        )
+    }
 }
 
 /// Remove workflow markers from the output of a service action, if any, before forwarding it to the caller.
@@ -238,9 +375,63 @@ fn without_workflow_markers(stdout: &str) -> String {
         .collect()
 }
 
-fn forward_output(stdout: &str, stderr: &str) {
-    print!("{}", without_workflow_markers(stdout));
+fn forward_output(output: &Output) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    print!("{}", without_workflow_markers(&stdout));
     eprint!("{stderr}");
+}
+
+/// Only the actions of the default service type are completed, as defined in system.toml.
+/// A completer cannot read the `--type` argument, so it cannot tell which service type is used.
+/// Even when the service type is known, a service plugin cannot be asked which actions it supports.
+fn action_completions() -> Vec<CompletionCandidate> {
+    let Ok(config_dir) = Utf8PathBuf::try_from(get_config_dir()) else {
+        return vec![];
+    };
+    action_completions_for_config_dir(&config_dir)
+}
+
+fn action_completions_for_config_dir(config_dir: &Utf8Path) -> Vec<CompletionCandidate> {
+    let Ok(config) = SystemConfig::try_new(config_dir) else {
+        return vec![];
+    };
+    config
+        .init
+        .action_names()
+        .into_iter()
+        .map(CompletionCandidate::new)
+        .collect()
+}
+
+fn service_type_completions() -> Vec<CompletionCandidate> {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current()
+            .block_on(service_type_completions_for_config_dir(get_config_dir()))
+    })
+}
+
+async fn service_type_completions_for_config_dir(
+    config_dir: impl AsRef<Path>,
+) -> Vec<CompletionCandidate> {
+    let mut types = BTreeSet::from([DEFAULT_SERVICE_TYPE.to_string()]);
+    if let Ok(config) = TEdgeConfig::load(config_dir).await {
+        for dir in &config.service.plugin_paths.0 {
+            let Ok(mut entries) = tokio::fs::read_dir(dir).await else {
+                continue;
+            };
+            while let Ok(Some(entry)) = entries.next_entry().await {
+                let is_file = tokio::fs::metadata(entry.path())
+                    .await
+                    .is_ok_and(|metadata| metadata.is_file());
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_file && name.parse::<ServiceType>().is_ok() {
+                    types.insert(name);
+                }
+            }
+        }
+    }
+    types.into_iter().map(CompletionCandidate::new).collect()
 }
 
 #[cfg(test)]
@@ -326,6 +517,113 @@ disable = ["/bin/true", "{}"]
             err.to_string().ends_with("failed with exit code 3"),
             "{err}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_not_completing_in_time_is_terminated() {
+        let dir = TempTedgeDir::new();
+        let plugin = dir.path().join("container");
+        with_exec_permission(&plugin, "#!/bin/sh\nsleep 60\n");
+
+        let mut cmd = command("start", "nodered", "container");
+        cmd.plugin_paths = vec![dir.path().to_path_buf()];
+        cmd.graceful_timeout = Duration::from_millis(100);
+        cmd.forceful_timeout = Duration::from_secs(1);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), cmd.run_plugin_action())
+            .await
+            .expect("the plugin to be terminated on timeout")
+            .unwrap_err();
+
+        assert_matches!(err, ServiceActionError::PluginTerminated { .. });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The service plugin {plugin} did not complete within 100ms and was stopped with SIGTERM"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plugin_ignoring_sigterm_is_not_reported_as_stopped_with_sigterm() {
+        let dir = TempTedgeDir::new();
+        let plugin = dir.path().join("container");
+        with_exec_permission(&plugin, "#!/bin/sh\ntrap '' TERM\nsleep 60\n");
+
+        let mut cmd = command("start", "nodered", "container");
+        cmd.plugin_paths = vec![dir.path().to_path_buf()];
+        cmd.graceful_timeout = Duration::from_secs(1);
+        cmd.forceful_timeout = Duration::from_millis(200);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), cmd.run_plugin_action())
+            .await
+            .expect("the plugin to be killed on timeout")
+            .unwrap_err();
+
+        assert_matches!(err, ServiceActionError::PluginTerminated { .. });
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The service plugin {plugin} did not complete within 1s and did not stop within 200ms after SIGTERM, so it was killed with SIGKILL"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn an_init_system_command_not_completing_in_time_is_terminated() {
+        let config_dir = TempTedgeDir::new();
+        config_dir.file("system.toml").with_raw_content(
+            r#"[init]
+name = "test"
+is_available = ["/bin/true"]
+start = ["/bin/sh", "-c", "sleep 60", "{}"]
+stop = ["/bin/true", "{}"]
+restart = ["/bin/true", "{}"]
+enable = ["/bin/true", "{}"]
+disable = ["/bin/true", "{}"]
+is_active = ["/bin/true", "{}"]
+"#,
+        );
+
+        let mut cmd = command("start", "nginx", "service");
+        cmd.graceful_timeout = Duration::from_millis(100);
+        cmd.forceful_timeout = Duration::from_secs(1);
+
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            cmd.run_init_system_action(config_dir.path()),
+        )
+        .await
+        .expect("the init system command to be terminated on timeout")
+        .unwrap_err();
+
+        assert_matches!(err, ServiceActionError::InitSystemTerminated { .. });
+        assert_eq!(
+            err.to_string(),
+            "The init system command </bin/sh -c sleep 60 nginx> did not complete within 100ms and was stopped with SIGTERM"
+        );
+    }
+
+    #[test_case(Termination::Timeout { timeout: Duration::from_secs(1) })]
+    #[test_case(Termination::KilledOnTimeout { timeout: Duration::from_secs(1), forceful_timeout: Duration::from_secs(1) })]
+    #[test_case(Termination::NotStopped)]
+    fn an_action_not_completing_in_time_exits_with_the_timeout_exit_code(termination: Termination) {
+        let err = ServiceActionError::PluginTerminated {
+            plugin: "/usr/share/tedge/service-plugins/container".into(),
+            termination,
+        };
+
+        assert!(err.is_timeout());
+    }
+
+    #[test]
+    fn an_interrupted_action_does_not_exit_with_the_timeout_exit_code() {
+        let err = ServiceActionError::PluginTerminated {
+            plugin: "/usr/share/tedge/service-plugins/container".into(),
+            termination: Termination::Interrupted,
+        };
+
+        assert!(!err.is_timeout());
     }
 
     #[tokio::test]
@@ -441,12 +739,77 @@ disable = ["/bin/true", "{}"]
         );
     }
 
+    #[test]
+    fn the_actions_defined_in_system_toml_are_completed() {
+        let config_dir = TempTedgeDir::new();
+        init_system(&config_dir);
+
+        let actions: Vec<_> = action_completions_for_config_dir(config_dir.path())
+            .iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            actions,
+            [
+                "disable",
+                "enable",
+                "is_active",
+                "reload",
+                "restart",
+                "start",
+                "stop"
+            ]
+        );
+    }
+
+    #[test]
+    fn the_standard_actions_are_completed_when_there_is_no_system_toml() {
+        let config_dir = TempTedgeDir::new();
+
+        let actions: Vec<_> = action_completions_for_config_dir(config_dir.path())
+            .iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(
+            actions,
+            ["disable", "enable", "is_active", "restart", "start", "stop"]
+        );
+    }
+
+    #[tokio::test]
+    async fn the_service_types_completed_are_the_default_type_and_the_plugin_files() {
+        let config_dir = TempTedgeDir::new();
+        let first = config_dir.dir("first");
+        let second = config_dir.dir("second");
+        service_plugin(first.path(), "container");
+        service_plugin(second.path(), "container");
+        service_plugin(second.path(), "lxc");
+        second.dir("not-a-plugin");
+        config_dir.file("tedge.toml").with_raw_content(&format!(
+            "service.plugin_paths = [\"{}\", \"{}\", \"/no/such/directory\"]",
+            first.path(),
+            second.path()
+        ));
+
+        let types: Vec<_> = service_type_completions_for_config_dir(config_dir.path())
+            .await
+            .iter()
+            .map(|candidate| candidate.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert_eq!(types, ["container", "lxc", "service"]);
+    }
+
     fn command(action: &str, service_name: &str, service_type: &str) -> ServiceActionCommand {
         ServiceActionCommand {
             action: action.parse().unwrap(),
             service_name: service_name.parse().unwrap(),
             service_type: service_type.parse().unwrap(),
-            plugin_paths: vec!["/usr/share/tedge/service-plugins".into()],
+            plugin_paths: vec![],
+            graceful_timeout: Duration::from_secs(10),
+            forceful_timeout: Duration::from_secs(10),
         }
     }
 

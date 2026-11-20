@@ -148,7 +148,9 @@ and combined them with the builtin workflows implemented by the agent itself.
 
 Each workflow is defined using a TOML file stored in `/etc/tedge/operations`. Each specifies:
 - the command name that it should trigger on
-  such as `firmware_update` or `restart`
+  such as `firmware_update` or `restart`,
+  or [several command names](#workflow-operation-array)
+- optionally, the [type of entity](#workflow-entity-type) the workflow applies to
 - the list of states
 - for each state:
   - the state name as defined by the operation API
@@ -209,11 +211,62 @@ on_error = "failed"
 %%te%% combines all these workflows to determine what has to be done
 when a state message is published for a command on a topic matching the global topic filter for commands,
 i.e. `te/+/+/+/+/cmd/+/+`.
-- Each running instance of the __tedge_agent__ reacts only on commands targeting its own device.
-- If a user-defined workflow has been defined for this operation, then this workflow is used to determine the required action.
+- Each running instance of the __tedge_agent__ reacts only on commands targeting its own device
+  or a service of that device.
+- If a user-defined workflow has been defined for this operation and this entity type,
+  then this workflow is used to determine the required action.
 - If no workflow has been defined by the user for this operation, then the builtin workflow is used.
 - If there is no workflow or no defined action for the current state,
   then the __tedge_agent__ simply waits for another component to take over the command.
+
+### Scoping a workflow to an entity type {#workflow-entity-type}
+
+The same operation name can need two different workflows depending on what it is addressed to.
+Uploading the logs of a device is not uploading the logs of one of its services.
+
+A workflow therefore declares the type of entity it applies to, with a `type` field:
+
+```toml title="file: service_log_upload_example.toml"
+operation = "log_upload"
+type = "service"
+
+[init]
+  action = "proceed"
+  on_success = "executing"
+```
+
+`type` takes one of the entity `@type` values: `device` or `service`.
+It defaults to `device`.
+
+A workflow applies to a command only if the target entity has the declared type.
+`log_upload` can therefore have two workflows:
+one with `type = "service"` for the service entity, and one without `type` for the device entity.
+
+An operation name comes from the `operation` field inside the file, never from the file name,
+so two workflows for the same operation only have to be in two files with different names.
+
+A workflow with `type = "service"` publishes no capability.
+Each service publishes the capability itself.
+
+### One workflow for several operations {#workflow-operation-array}
+
+The `operation` field can be an array of operation names,
+when several operations go through the same steps:
+
+```toml title="file: lock_unlock.toml"
+operation = ["lock", "unlock"]
+
+[init]
+  action = "proceed"
+  on_success = "executing"
+
+[executing]
+  script = "/etc/tedge/operations/lock.sh ${.topic.operation}"
+  on_success = "successful"
+```
+
+The file defines one workflow for each operation of the array.
+A step reads the operation of the current command from `${.topic.operation}`.
 
 ### Script Execution
 
@@ -344,7 +397,8 @@ After the restart, the workflow will resume in the state specified by the workfl
 
 ```toml
 [agent-restart]
-background_script = "sudo systemctl restart tedge-agent"
+background_script = "systemctl restart tedge-agent"
+sudo = true
 on_exec = "waiting-for-restart"
 
 [waiting-for-restart]
@@ -355,6 +409,55 @@ on_stdout = [ "successful_restart", "failed_restart"]
 Note that:
 - No `on_exit` nor `on_kill` status can be provided, as the script is not monitored.
 - If the script cannot be launched, the workflow will be moved to the final `"failed"` state.
+
+### Running a script with elevated privileges {#workflow-script-sudo}
+
+A script or a background script that needs root can be run through `sudo`
+by setting `sudo = true` on its state,
+rather than starting the command line with `sudo`:
+
+```toml
+[execute]
+script = "tedge service ${.payload.action} ${.payload.serviceName} --type ${.payload.serviceType}"
+sudo = true
+on_success = "successful"
+```
+
+The workflow states which steps need root;
+the device configuration decides how the script is launched:
+
+| `sudo.enable` | `sudo` in `$PATH` | Launched as                      |
+|---------------|-------------------|----------------------------------|
+| `true`        | yes               | `sudo -n -- <command> <args...>` |
+| `true`        | no                | `<command> <args...>`            |
+| `false`       | either            | `<command> <args...>`            |
+
+So the same workflow works on a device where the agent runs as the `tedge` user with sudo,
+and on one where the agent runs as root without sudo installed.
+
+Note that:
+- `sudo` is a boolean and defaults to `false`.
+- `sudo = true` is only accepted on `script` and `background_script` states.
+  A workflow setting it on any other state, including an `operation` state with an `input_script`, is rejected.
+- `sudo` is invoked with `-n`, so it fails instead of prompting for a password.
+  The sudoers rules decide which commands can be run.
+  A command that these rules do not allow fails,
+  and the state's `on_exit` handlers decide the next state, as for any failing script.
+  When sudo refuses a command, the operation log shows the error `sudo refused to run '<command>'`,
+  and the failure reason is, for example, `/usr/bin/sudo returned exit code 1`.
+- The `sudo -n --` prefix is added after the `${...}` values are substituted,
+  so a substituted argument cannot be split into extra `sudo` arguments.
+- Do not let the payload provide the command of an elevated step, as in `script = "${.payload.command}"`.
+  The cloud could then run as root any command that the sudoers rules allow.
+  A script starting with `sudo -n ${...}` has the same problem,
+  and `sudo` can also read the payload value as an option (*e.g.* `-u` or `-E`) or an environment assignment (`VAR=value`).
+- The operation log shows the command line as launched, including `sudo -n --` when it is used.
+  When `sudo.enable` is `true` but `sudo` is not found, the log records a warning and the script is run directly.
+  On a device where the agent runs as root without `sudo`, set `sudo.enable` to `false` to stop this warning.
+- The value of `sudo.enable` is the one read when the agent started.
+- On timeout, the agent sends `SIGTERM` to the script, which `sudo` passes on to the elevated command.
+  `sudo` cannot pass on the final `SIGKILL`, so an elevated command that ignores `SIGTERM` can outlive its step.
+- A command line which starts with `sudo` itself still works, but ignores `sudo.enable`.
 
 ### Sub-Operation Execution {#sub-operation-execution}
 
@@ -441,7 +544,8 @@ For those any timeout has to be set on the waiting state.
 
 ```toml
 ["device-restart"]
-background_script = "sudo reboot"
+background_script = "reboot"
+sudo = true
 on_exec = "waiting-for-restart"
 
 ["waiting-for-restart"]
@@ -501,7 +605,8 @@ that awaits the agent restart using the `await-agent-restart` action after the s
 
 ```toml
 ["device-restart"]
-background_script = "sudo reboot"
+background_script = "reboot"
+sudo = true
 on_exec = "waiting-for-restart"
 
 ["waiting-for-restart"]
@@ -512,7 +617,7 @@ on_success = "successful_restart"
 ```
 
 As for regular scripts, the parameters of a background script can be populated from the current command state,
-as in `background_script = "sudo shutdown --reboot ${.payload.reboot_delay}"`
+as in `background_script = "shutdown --reboot ${.payload.reboot_delay}"` with `sudo = true`.
 
 #### Awaiting Sub-Command Completion
 
