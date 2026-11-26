@@ -1,6 +1,8 @@
 #[cfg(test)]
 use std::result::Result::Ok;
 use tedge_actors::Runtime;
+use tedge_api::control::ControlCapability;
+use tedge_api::control::TEDGE_SERVICE_ACTIONS;
 use tedge_api::mqtt_topics::DeviceTopicId;
 use tedge_api::mqtt_topics::MqttSchema;
 use tedge_api::mqtt_topics::Service;
@@ -9,11 +11,13 @@ use tedge_config::TEdgeConfig;
 use tedge_config_ext::ConfigPublisherBuilder;
 use tedge_health_ext::HealthMonitorBuilder;
 use tedge_mqtt_ext::MqttActorBuilder;
+use tedge_supervisor::SupervisorMode;
 
 pub async fn start_basic_actors(
     mapper_name: &str,
     config: &TEdgeConfig,
     exposed_config: Vec<(String, Option<serde_json::Value>)>,
+    supervisor_mode: SupervisorMode,
 ) -> Result<(Runtime, MqttActorBuilder), anyhow::Error> {
     let mut runtime = Runtime::new();
 
@@ -41,7 +45,8 @@ pub async fn start_basic_actors(
         &mut mqtt_actor,
         &mqtt_schema,
         &config.service,
-    );
+    )
+    .with_control_capability(mapper_actions(supervisor_mode));
 
     let config_publisher = ConfigPublisherBuilder::new(
         mqtt_schema,
@@ -55,6 +60,16 @@ pub async fn start_basic_actors(
     runtime.spawn(health_actor).await?;
     runtime.spawn(config_publisher).await?;
     Ok((runtime, mqtt_actor))
+}
+
+/// A mapper in a single process has no init unit of its own, so no actions using init system should be declared.
+/// The mapper clears its retained `cmd/control` message,
+/// because the same mapper may have run standalone before and published `{"actions":["restart"]}` there.
+fn mapper_actions(supervisor_mode: SupervisorMode) -> ControlCapability {
+    match supervisor_mode {
+        SupervisorMode::Standalone => ControlCapability::Declaring(TEDGE_SERVICE_ACTIONS),
+        SupervisorMode::MultiUnit => ControlCapability::Clearing,
+    }
 }
 
 async fn get_mqtt_actor(

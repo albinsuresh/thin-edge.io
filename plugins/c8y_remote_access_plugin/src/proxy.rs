@@ -24,12 +24,12 @@ use thiserror::Error;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio::net::ToSocketAddrs;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
 use url::Url;
 use ws_stream_tungstenite::WsStream;
 
+use crate::mux;
 use crate::SUCCESS_MESSAGE;
 
 /// This proxy creates a TCP connection to a local socket and creates a websocket. Cumulocity cloud will initiate a
@@ -38,6 +38,8 @@ use crate::SUCCESS_MESSAGE;
 pub struct WebsocketSocketProxy {
     socket: TcpStream,
     websocket: Websocket,
+    /// address of the target, used for further connections in multiplexing mode
+    target: String,
 }
 
 #[derive(Diagnostic, Error, Debug)]
@@ -45,14 +47,14 @@ pub struct WebsocketSocketProxy {
 struct SocketError(#[from] std::io::Error);
 
 impl WebsocketSocketProxy {
-    pub async fn connect<SA: ToSocketAddrs + std::fmt::Debug>(
+    pub async fn connect(
         url: &Url,
-        socket: SA,
+        target: String,
         auth: Auth,
         config: Option<ClientConfig>,
         proxy: &TEdgeConfigReaderProxy,
     ) -> miette::Result<Self> {
-        let socket_future = TcpStream::connect(socket);
+        let socket_future = TcpStream::connect(target.clone());
         let websocket_future = Websocket::new(url, auth.authorization_header(), config, proxy);
 
         match join(socket_future, websocket_future).await {
@@ -60,30 +62,87 @@ impl WebsocketSocketProxy {
             (_, Err(websocket_error)) => Err(websocket_error),
             (Ok(socket), Ok(websocket)) => {
                 println!("{SUCCESS_MESSAGE}");
-                Ok(WebsocketSocketProxy { socket, websocket })
+                Ok(WebsocketSocketProxy {
+                    socket,
+                    websocket,
+                    target,
+                })
             }
         }
     }
 
     pub async fn run(mut self) {
         let (mut ws_reader, mut ws_writer) = self.websocket.socket.split();
+        let received = match mux::negotiate(&mut ws_reader, self.socket.peek(&mut [0u8; 1])).await {
+            Ok(mux::Mode::Passthrough(received)) => received,
+            Ok(mux::Mode::Multiplex(received)) => {
+                drop(self.socket);
+                let websocket = ws_reader
+                    .reunite(ws_writer)
+                    .expect("the halves belong to the same websocket");
+                let _ = mux::run(websocket, received, self.target).await;
+                return;
+            }
+            Err(_) => {
+                let _ = ws_writer.close().await;
+                return;
+            }
+        };
+
         let (mut reader, mut writer) = self.socket.split();
         let (mut reader, mut writer) = (reader.compat_mut(), writer.compat_mut());
+        // data the client sent while the mode was negotiated
+        if !received.is_empty() && writer.write_all(&received).await.is_err() {
+            let _ = ws_writer.close().await;
+            return;
+        }
         let incoming = futures_util::io::copy(&mut ws_reader, &mut writer);
-        let outgoing = futures_util::io::copy(&mut reader, &mut ws_writer);
+        let outgoing = copy_and_flush(&mut reader, &mut ws_writer);
         {
             futures::pin_mut!(incoming);
             futures::pin_mut!(outgoing);
 
             select(incoming, outgoing).await;
         }
-        println!("STOPPING");
         let _ = join(ws_writer.close(), writer.close()).await;
+    }
+}
+
+/// Copies data from `reader` to `writer` until `reader` reaches EOF, flushing `writer` after every write.
+///
+/// The websocket writer may keep written data buffered until it is flushed, and
+/// `futures_util::io::copy` only flushes at EOF. Sockets that stay open (e.g. HTTP keep-alive)
+/// would otherwise not get the end of a transfer forwarded until more data arrives.
+pub(crate) async fn copy_and_flush<R, W>(reader: &mut R, writer: &mut W) -> std::io::Result<()>
+where
+    R: futures_util::io::AsyncRead + Unpin,
+    W: futures_util::io::AsyncWrite + Unpin,
+{
+    let mut buf = vec![0u8; 16 * 1024];
+    loop {
+        let n = reader.read(&mut buf).await?;
+        if n == 0 {
+            return Ok(());
+        }
+        writer.write_all(&buf[..n]).await?;
+        writer.flush().await?;
     }
 }
 
 struct Websocket {
     socket: WsStream<ClientStream<MaybeTlsStream>>,
+}
+
+/// Connects to the websocket server (or the HTTP proxy) with Nagle's algorithm disabled.
+///
+/// The connection carries interactive traffic. With Nagle's algorithm, a small message can be held
+/// back until the previous one has been acknowledged, which can add a delayed ACK timeout
+/// (typically up to 40 ms) to a response.
+async fn connect_without_delay(address: &str) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect(address).await?;
+    // an optimization only, the connection still works if the option cannot be set
+    let _ = stream.set_nodelay(true);
+    Ok(stream)
 }
 
 fn generate_sec_websocket_key() -> String {
@@ -160,7 +219,7 @@ impl Websocket {
             .ok_or(miette!("{url} does not contain a port"))?;
         let stream = if let Some(address) = proxy.address.or_none() {
             let host_port = format!("{}:{}", address.host(), address.port());
-            let stream = TcpStream::connect(&host_port).await.into_diagnostic()?;
+            let stream = connect_without_delay(&host_port).await.into_diagnostic()?;
             let mut stream = match address.scheme() {
                 ProxyScheme::Https => {
                     let connector: TlsConnector = config.clone().unwrap().into();
@@ -194,7 +253,7 @@ impl Websocket {
             stream
         } else {
             MaybeTlsStream::Plain(
-                TcpStream::connect(format!("{target_host}:{target_port}",))
+                connect_without_delay(&format!("{target_host}:{target_port}"))
                     .await
                     .into_diagnostic()?,
             )
@@ -402,6 +461,133 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn websocket_connections_disable_nagles_algorithm() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+
+        let stream = connect_without_delay(&address).await.unwrap();
+
+        assert!(stream.nodelay().unwrap());
+    }
+
+    #[tokio::test]
+    async fn client_data_is_forwarded_when_the_client_sends_first() {
+        // e.g. HTTP: the client sends first, the data read to negotiate the mode must reach the target
+        let app = Router::new().route("/ws", any(handler));
+
+        async fn handler(ws: WebSocketUpgrade) -> Response {
+            ws.protocols(["binary"]).on_upgrade(handle_socket)
+        }
+
+        async fn handle_socket(mut socket: WebSocket) {
+            use axum::extract::ws::Message;
+            socket
+                .send(Message::Binary("GET / HTTP/1.1\r\n\r\n".into()))
+                .await
+                .unwrap();
+            match socket.recv().await {
+                Some(Ok(Message::Binary(msg))) => {
+                    assert_eq!(
+                        std::str::from_utf8(&msg).unwrap(),
+                        "HTTP/1.1 200 OK\r\n\r\n"
+                    )
+                }
+                other => panic!("Expected a binary message, got {other:?}"),
+            }
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let axum_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_task = tokio::spawn(async move {
+            let (mut data, _) = target.accept().await.unwrap();
+            let mut request = [0; 18];
+            data.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"GET / HTTP/1.1\r\n\r\n");
+            data.write_all(b"HTTP/1.1 200 OK\r\n\r\n").await.unwrap();
+        });
+        let tedge_config = TEdgeConfig::load_toml_str("");
+
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            let proxy = WebsocketSocketProxy::connect(
+                &format!("ws://127.0.0.1:{axum_port}/ws").parse().unwrap(),
+                format!("127.0.0.1:{target_port}"),
+                Auth::test_value(HeaderValue::from_static("AUTHORIZATION HEADER")),
+                None,
+                &tedge_config.proxy,
+            )
+            .await
+            .unwrap();
+            proxy.run().await;
+            target_task.await.unwrap();
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn data_is_flushed_while_the_socket_stays_open() {
+        // The websocket writer may keep written data buffered until it is flushed. Data read from
+        // the local socket must be flushed without waiting for EOF, as the socket can stay open
+        // after a transfer (e.g. HTTP keep-alive).
+        let (mut socket, local) = tokio::io::duplex(1024);
+        let delivered = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut writer = DeliverOnFlush {
+            buffered: Vec::new(),
+            delivered: delivered.clone(),
+        };
+        tokio::spawn(async move { copy_and_flush(&mut local.compat(), &mut writer).await });
+
+        socket.write_all(b"response").await.unwrap();
+
+        // `socket` is not closed, so the reader does not reach EOF
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while delivered.lock().unwrap().as_slice() != b"response" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("data should be flushed while the socket stays open");
+        drop(socket);
+    }
+
+    /// A writer that only delivers data when it is flushed
+    struct DeliverOnFlush {
+        buffered: Vec<u8>,
+        delivered: Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl futures_util::io::AsyncWrite for DeliverOnFlush {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.buffered.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            mut self: Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let data = std::mem::take(&mut self.buffered);
+            self.delivered.lock().unwrap().extend(data);
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_close(
+            self: Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.poll_flush(cx)
+        }
     }
 
     fn sign(key: &[u8]) -> HeaderValue {

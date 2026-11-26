@@ -3,6 +3,7 @@ use crate::supported_operations::C8yPrefix;
 use crate::supported_operations::Operations;
 use crate::supported_operations::OperationsError;
 use crate::Capabilities;
+use c8y_api::domain_names::DomainNames;
 use c8y_api::json_c8y_deserializer::C8yDeviceControlTopic;
 use c8y_api::proxy_url::Protocol;
 use c8y_api::proxy_url::ProxyUrlGenerator;
@@ -12,7 +13,8 @@ use camino::Utf8Path;
 use serde_json::Value;
 use std::ops::Add;
 use std::sync::Arc;
-use tedge_api::file_transfer_url::FileTransferUrls;
+use std::time::Duration;
+use tedge_api::http_url::FileTransferUrls;
 use tedge_api::mqtt_topics::ChannelFilter::AnyCommand;
 use tedge_api::mqtt_topics::ChannelFilter::AnyCommandMetadata;
 use tedge_api::mqtt_topics::ChannelFilter::AnySignal;
@@ -25,6 +27,7 @@ use tedge_api::mqtt_topics::TopicIdError;
 use tedge_api::service_health_topic;
 use tedge_api::substitution::Record;
 use tedge_api::workflow::log::log_dir::OperationLogs;
+use tedge_api::workflow::log::logged_command::DEFAULT_EXIT_WAIT_AFTER_KILL;
 use tedge_config::models::AutoLogUpload;
 use tedge_config::models::SoftwareManagementApiFlag;
 use tedge_config::models::TopicPrefix;
@@ -53,6 +56,8 @@ pub struct C8yMapperConfig {
     pub service: TEdgeConfigReaderService,
     pub c8y_host: String,
     pub c8y_mqtt: String,
+    /// All the domain names of the tenant, detected at runtime from its certificate
+    pub domain_names: DomainNames,
     pub file_transfer_urls: FileTransferUrls,
     pub topics: TopicFilter,
     pub capabilities: Capabilities,
@@ -77,6 +82,9 @@ pub struct C8yMapperConfig {
 
     pub max_mqtt_payload_size: u32,
     pub alarm_sync_interval: &'static str,
+    /// How long a killed custom operation command is given to exit, by default
+    /// [`DEFAULT_EXIT_WAIT_AFTER_KILL`]
+    pub custom_operation_exit_wait_after_kill: Duration,
 }
 
 impl C8yMapperConfig {
@@ -133,6 +141,7 @@ impl C8yMapperConfig {
             service,
             c8y_host,
             c8y_mqtt,
+            domain_names: DomainNames::default(),
             file_transfer_urls,
             topics,
             capabilities,
@@ -157,6 +166,7 @@ impl C8yMapperConfig {
 
             max_mqtt_payload_size,
             alarm_sync_interval: alarm_interval,
+            custom_operation_exit_wait_after_kill: DEFAULT_EXIT_WAIT_AFTER_KILL,
         }
     }
 
@@ -205,6 +215,8 @@ impl C8yMapperConfig {
             device_profile: c8y_config.cloud_specific.enable.device_profile,
             device_restart: c8y_config.cloud_specific.enable.device_restart,
             software_update: c8y_config.cloud_specific.enable.software_update,
+            shell_execute: c8y_config.cloud_specific.enable.shell_execute,
+            service_control: c8y_config.cloud_specific.enable.service_control,
         };
         let bridge_config = BridgeConfig {
             c8y_prefix: c8y_config.bridge.topic_prefix.clone(),
@@ -347,6 +359,7 @@ impl From<&C8yMapperConfig> for C8YHttpConfig {
                 config.auth_proxy_protocol,
             ),
         )
+        .with_domain_names(config.domain_names.clone())
     }
 }
 

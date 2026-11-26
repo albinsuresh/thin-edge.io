@@ -8,6 +8,7 @@ use serde::Serialize;
 use serde::Serializer;
 use tedge_api::SoftwareListCommand;
 use tedge_api::SoftwareModule;
+use tedge_utils::control_chars::strip_control_chars;
 use tracing::warn;
 
 use super::message_ids::*;
@@ -17,6 +18,59 @@ pub type SmartRest = String;
 pub fn request_pending_operations() -> SmartrestPayload {
     SmartrestPayload::serialize(GET_PENDING_OPERATIONS)
         .expect("shouldn't put payload over size limit")
+}
+
+/// The operation a SmartREST status update refers to, by its ID or its type
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationReference {
+    /// The ID of the operation, used when `smartrest.use_operation_id` is enabled
+    Id(String),
+    /// The type of the operation, e.g. `c8y_Restart`, for Cumulocity to update
+    /// the oldest matching operation of that type
+    Name(String),
+}
+
+impl OperationReference {
+    /// Refers to the operation by `op_id` when known and `use_operation_id` is
+    /// set, otherwise by `name`
+    pub fn new(op_id: Option<String>, use_operation_id: bool, name: String) -> Self {
+        match op_id {
+            Some(op_id) if use_operation_id => OperationReference::Id(op_id),
+            _ => OperationReference::Name(name),
+        }
+    }
+
+    /// Generates a SmartREST message to set the operation to executing
+    pub fn executing(&self) -> SmartrestPayload {
+        match self {
+            OperationReference::Id(op_id) => set_operation_executing_with_id(op_id),
+            OperationReference::Name(name) => set_operation_executing_with_name(name),
+        }
+    }
+
+    /// Generates a SmartREST message to set the operation to failed with the
+    /// given reason
+    pub fn failed(&self, reason: &str) -> SmartrestPayload {
+        match self {
+            OperationReference::Id(op_id) => fail_operation_with_id(op_id, reason),
+            OperationReference::Name(name) => fail_operation_with_name(name, reason),
+        }
+    }
+
+    /// Generates a SmartREST message to set the operation to successful with a
+    /// text or CSV result, as [`succeed_operation`] does
+    ///
+    /// # Errors
+    /// Returns an error if the result is an empty CSV, or one with several records
+    pub fn succeeded(
+        &self,
+        result: impl Into<TextOrCsv>,
+    ) -> Result<SmartrestPayload, SmartRestSerializerError> {
+        match self {
+            OperationReference::Id(op_id) => succeed_operation_with_id(op_id, result),
+            OperationReference::Name(name) => succeed_operation_with_name(name, result),
+        }
+    }
 }
 
 /// Generates a SmartREST message to set the provided operation to executing
@@ -42,6 +96,8 @@ pub fn fail_operation_with_id(op_id: &str, reason: &str) -> SmartrestPayload {
 }
 
 fn fail_operation(template_id: usize, operation: &str, reason: &str) -> SmartrestPayload {
+    let reason = &strip_control_chars(reason);
+
     // If the failure reason exceeds 500 bytes, truncate it
     if reason.len() <= 500 {
         SmartrestPayload::serialize((template_id, operation, reason))
@@ -105,6 +161,9 @@ fn succeed_static_operation(
 /// If the provided CSV does not match the standard Cumulocity format, the standard CSV escaping
 /// rules will be applied. For example, `a,field "with" quotes` will be converted to
 /// `a,"field ""with"" quotes"` before being appended to the output of this function.
+///
+/// The characters rejected by Cumulocity, e.g. the terminal color escape sequences,
+/// are removed from the payload.
 ///
 /// If the message size turns out to be bigger than maximum cumulocity message size, it will be truncated to fit in the
 /// limit.
@@ -203,6 +262,7 @@ pub enum CumulocitySupportedOperations {
     C8yDownloadConfigFile,
     C8yFirmware,
     C8yDeviceProfile,
+    C8yServiceCommand,
     C8yCustom(String),
 }
 
@@ -216,6 +276,7 @@ impl CumulocitySupportedOperations {
             CumulocitySupportedOperations::C8yDownloadConfigFile => "c8y_DownloadConfigFile",
             CumulocitySupportedOperations::C8yFirmware => "c8y_Firmware",
             CumulocitySupportedOperations::C8yDeviceProfile => "c8y_DeviceProfile",
+            CumulocitySupportedOperations::C8yServiceCommand => "c8y_ServiceCommand",
             CumulocitySupportedOperations::C8yCustom(operation) => operation.as_str(),
         }
     }
@@ -345,11 +406,26 @@ impl C8yOperation for &String {
     }
 }
 
-#[derive(Debug, Serialize, Eq, PartialEq)]
-#[serde(untagged)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum TextOrCsv {
     Text(String),
     Csv(EmbeddedCsv),
+}
+
+/// Serializes the text, or the CSV fields, without the characters rejected by Cumulocity.
+///
+/// CSV fields are stripped individually during serialization,
+/// so the delimiters and quotes are not taken as part of an escape sequence.
+impl Serialize for TextOrCsv {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match self {
+            TextOrCsv::Text(text) => serializer.serialize_str(&strip_control_chars(text)),
+            TextOrCsv::Csv(csv) => csv.serialize(serializer),
+        }
+    }
 }
 
 impl From<EmbeddedCsv> for TextOrCsv {
@@ -382,7 +458,7 @@ impl Serialize for EmbeddedCsv {
         let record = parse_single_record(&self.0)?;
         let mut seq = serializer.serialize_seq(Some(record.len()))?;
         for field in record.iter() {
-            seq.serialize_element(field)?;
+            seq.serialize_element(&strip_control_chars(field))?;
         }
         seq.end()
     }
@@ -415,10 +491,25 @@ mod tests {
     use crate::smartrest::message::MAX_PAYLOAD_LIMIT_IN_BYTES;
 
     use super::*;
+    use rstest::rstest;
     use tedge_api::commands::SoftwareListCommandPayload;
     use tedge_api::mqtt_topics::EntityTopicId;
     use tedge_api::Jsonify;
     use test_case::test_case;
+
+    #[rstest]
+    #[case::by_id_when_known_and_enabled(Some("123"), true, "504,123")]
+    #[case::by_name_when_ids_are_disabled(Some("123"), false, "501,c8y_Command")]
+    #[case::by_name_when_the_id_is_unknown(None, true, "501,c8y_Command")]
+    fn operation_status_refers_to_the_operation(
+        #[case] op_id: Option<&str>,
+        #[case] use_id: bool,
+        #[case] expected: &str,
+    ) {
+        let operation =
+            OperationReference::new(op_id.map(str::to_owned), use_id, "c8y_Command".to_owned());
+        assert_eq!(operation.executing().as_str(), expected);
+    }
 
     #[test]
     fn serialize_smartrest_supported_operations() {
@@ -722,6 +813,49 @@ mod tests {
                 &field[field.len().saturating_sub(30)..]
             );
         }
+    }
+
+    #[test]
+    fn succeed_operation_removes_control_chars() {
+        let smartrest = succeed_operation_with_id(
+            "1234",
+            TextOrCsv::Text("\x1b[31mhello\x1b[0m\n\0world".into()),
+        )
+        .unwrap();
+
+        assert_eq!(smartrest.as_str(), "506,1234,\"hello\nworld\"");
+    }
+
+    #[test]
+    fn succeed_operation_removes_control_chars_from_csv() {
+        let smartrest =
+            succeed_operation_with_id("1234", EmbeddedCsv::new("\x1b[1mfoo\x1b[0m,bar\x07".into()))
+                .unwrap();
+
+        assert_eq!(smartrest.as_str(), "506,1234,foo,bar");
+    }
+
+    #[test]
+    fn succeed_operation_keeps_the_csv_fields_following_an_escape_character() {
+        let smartrest =
+            succeed_operation_with_id("1234", EmbeddedCsv::new("foo\x1b,bar".into())).unwrap();
+
+        assert_eq!(smartrest.as_str(), "506,1234,foo,bar");
+    }
+
+    #[test]
+    fn fail_operation_removes_control_chars() {
+        let smartrest = fail_operation_with_id("1234", "\x1b[31merror\x1b[0m: a\x1bb");
+
+        assert_eq!(smartrest.as_str(), "505,1234,error: a");
+    }
+
+    #[test]
+    fn escape_sequences_do_not_count_toward_the_failure_reason_limit() {
+        let reason = format!("{}error", "\x1b[31m".repeat(100));
+        let smartrest = fail_operation_with_id("1234", &reason);
+
+        assert_eq!(smartrest.as_str(), "505,1234,error");
     }
 
     #[test]

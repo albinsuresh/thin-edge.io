@@ -4,6 +4,7 @@ use crate::core::mqtt::configure_proxy;
 use crate::flows_config;
 use anyhow::Context;
 use async_trait::async_trait;
+use c8y_api::domain_names::CertificateMonitor;
 use c8y_api::http_proxy::read_c8y_credentials;
 use c8y_auth_proxy::actor::C8yAuthProxyBuilder;
 use c8y_mapper_ext::actor::C8yMapperBuilder;
@@ -12,6 +13,7 @@ use c8y_mapper_ext::availability::AvailabilityConfig;
 use c8y_mapper_ext::bridge_readiness::BridgeMonitorBuilder;
 use c8y_mapper_ext::config::C8yMapperConfig;
 use c8y_mapper_ext::converter::CumulocityConverter;
+use c8y_mapper_ext::domain_name_refresh::DomainNameRefreshBuilder;
 use mqtt_channel::Config;
 use tedge_actors::Runtime;
 use tedge_api::entity::EntityExternalId;
@@ -39,6 +41,7 @@ use tedge_mqtt_bridge::MqttBridgeActorBuilder;
 use tedge_mqtt_bridge::MqttOptions;
 use tedge_mqtt_bridge::QoS;
 use tedge_mqtt_ext::MqttActorBuilder;
+use tedge_supervisor::SupervisorMode;
 use tedge_timer_ext::TimerActor;
 use tedge_uploader_ext::UploaderActor;
 use tedge_utils::paths::ManagedDir;
@@ -77,6 +80,7 @@ impl TEdgeComponent for CumulocityMapper {
         &self,
         tedge_config: TEdgeConfig,
         cfg_dir: &TedgePaths,
+        supervisor_mode: SupervisorMode,
     ) -> Result<Runtime, anyhow::Error> {
         let c8y_config = tedge_config.mapper_config(&self.profile)?;
         let prefix = &c8y_config.bridge.topic_prefix;
@@ -86,8 +90,13 @@ impl TEdgeComponent for CumulocityMapper {
             tedge_config::models::CloudType::C8y,
             self.profile.as_ref(),
         )?;
-        let (mut runtime, mut mqtt_actor) =
-            start_basic_actors(&c8y_mapper_name, &tedge_config, exposed_config).await?;
+        let (mut runtime, mut mqtt_actor) = start_basic_actors(
+            &c8y_mapper_name,
+            &tedge_config,
+            exposed_config,
+            supervisor_mode,
+        )
+        .await?;
         let service_topic_id = EntityTopicId::default_main_service(&c8y_mapper_name)?;
 
         let c8y_mapper_config = C8yMapperConfig::from_tedge_config(
@@ -127,8 +136,6 @@ impl TEdgeComponent for CumulocityMapper {
         }
 
         let mut http_actor = HttpActor::new(tedge_config.http.client_tls_config()?).builder();
-        let c8y_auth_proxy_actor =
-            C8yAuthProxyBuilder::try_from_config(&tedge_config, &c8y_config).await?;
 
         let mut fs_watch_actor = FsWatchActorBuilder::new();
         let mut cmd_watcher_actor = WatchActorBuilder::new();
@@ -138,6 +145,17 @@ impl TEdgeComponent for CumulocityMapper {
         let cloud_root_certs = tedge_config.cloud_root_certs().await?;
         let mut uploader_actor =
             UploaderActor::new(identity.clone(), cloud_root_certs.clone()).builder();
+        let domain_name_refresh = c8y_api::domain_names::spawn_detection(
+            &c8y_mapper_config.c8y_host,
+            &cloud_root_certs,
+            c8y_mapper_config.domain_names.clone(),
+        );
+        let c8y_auth_proxy_actor = C8yAuthProxyBuilder::try_from_config(
+            &tedge_config,
+            &c8y_config,
+            CertificateMonitor::new(domain_name_refresh.clone()),
+        )
+        .await?;
         let mut downloader_actor = DownloaderActor::new(identity, cloud_root_certs).builder();
 
         // MQTT client dedicated to monitor the c8y-bridge client status and also
@@ -160,6 +178,12 @@ impl TEdgeComponent for CumulocityMapper {
                 &mut mqtt_actor,
             ),
         };
+
+        let domain_name_refresh = DomainNameRefreshBuilder::new(
+            &mut service_monitor_actor,
+            &c8y_mapper_config,
+            domain_name_refresh,
+        );
 
         C8yMapperBuilder::init(&c8y_mapper_config).await?;
         let mut c8y_mapper_actor = C8yMapperBuilder::try_new(
@@ -193,6 +217,7 @@ impl TEdgeComponent for CumulocityMapper {
         c8y_mapper_actor.set_flow_context(flows_mapper.context_handle());
 
         runtime.spawn(bridge_monitor).await?;
+        runtime.spawn(domain_name_refresh).await?;
         runtime.spawn(flows_mapper).await?;
         runtime.spawn(cmd_watcher_actor).await?;
         runtime.spawn(mqtt_actor).await?;
@@ -701,6 +726,35 @@ mqtt_service.topics = ["custom/topic"]
             assert_eq!(
                 rules.remote_subscriptions().collect::<Vec<_>>(),
                 vec!["rcgen self signed cert/#"]
+            );
+        }
+
+        #[tokio::test]
+        async fn mapper_device_id_template_prefers_explicit_device_id_over_cert_cn() {
+            let (ttd, _config) = load_config("").await;
+            let mapper_dir = ttd.dir("mappers").dir("c8y");
+            let certificate = rcgen::generate_simple_self_signed(vec!["my-device".into()]).unwrap();
+            mapper_dir
+                .file("cert.pem")
+                .with_raw_content(&certificate.cert.pem());
+            mapper_dir
+                .file("key.pem")
+                .with_raw_content(&certificate.signing_key.serialize_pem());
+            mapper_dir.file("mapper.toml").with_raw_content(
+                "device.id = \"explicit-id\"\ndevice.cert_path = \"./cert.pem\"\ndevice.key_path = \"./key.pem\"\n",
+            );
+            mapper_dir.dir("bridge").file("mqtt-core.toml").with_raw_content(
+                "local_prefix = \"\"\nremote_prefix = \"\"\n\n[[rule]]\ntopic = \"${mapper.device.id}/#\"\ndirection = \"inbound\"\n",
+            );
+            let config = TEdgeConfig::load(ttd.path()).await.unwrap();
+
+            let rules = bridge_rules(&config, None, AuthMethod::Certificate)
+                .await
+                .unwrap();
+
+            assert_eq!(
+                rules.remote_subscriptions().collect::<Vec<_>>(),
+                vec!["explicit-id/#"]
             );
         }
     }

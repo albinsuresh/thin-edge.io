@@ -1,0 +1,30 @@
+[package]
+name = "tedge_mapper_config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+
+[dependencies]
+async-trait = { workspace = true }
+camino = { workspace = true }
+facet = { workspace = true }
+facet-toml = { workspace = true }
+humantime = { workspace = true }
+tedge_config_engine = { workspace = true }
+tedge_config_engine-macro = { workspace = true }
+tedge_utils = { workspace = true }
+tokio = { workspace = true, features = ["fs"] }
+
+[dev-dependencies]
+assert_matches = { workspace = true }
+rstest = { workspace = true }
+tedge_config = { workspace = true }
+tedge_test_utils = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt"] }
+toml = { workspace = true }
+
+[lints]
+workspace = true

@@ -27,25 +27,10 @@ pub fn get_smartrest_template_id(payload: &str) -> String {
     payload.split(',').next().unwrap().to_string()
 }
 
-/// Sanitize the input to be SmartREST compatible.
-/// If the input contains invalid UTF-8, it returns an empty String.
-/// - Remove all control characters except for `\n`, `\t`, `\r`.
-/// - Double quote is escaped as `\"\"`.
-/// - Strip the input according to `max_size`.
-// TODO: make this return Result
-// TODO: make a variant which assumes `max_size = MAX_PAYLOAD_LIMIT_IN_BYTES`
-pub fn sanitize_bytes_for_smartrest(input: &[u8], max_size: usize) -> String {
-    let input = std::str::from_utf8(input).unwrap_or_else(|err| {
-        error!("The input contains invalid UTF-8: {err}");
-        ""
-    });
-    sanitize_for_smartrest(input, max_size)
-}
-
-pub fn sanitize_for_smartrest(input: &str, max_size: usize) -> String {
+/// Truncates the input to `max_size` bytes, on a character boundary.
+pub fn truncate_for_smartrest(input: &str, max_size: usize) -> String {
     input
         .chars()
-        .filter(|&c| c == '\r' || c == '\n' || c == '\t' || !c.is_control())
         .scan(0, |bytes_count, c| {
             *bytes_count += c.len_utf8();
             Some((*bytes_count, c))
@@ -62,7 +47,12 @@ pub fn sanitize_for_smartrest(input: &str, max_size: usize) -> String {
 ///
 /// If the input has only one line, returns the line only.
 /// If the input is empty or contains invalid UTF-8, it returns an empty String.
-/// The output is ensured to be SmartREST compatible.
+/// The output is truncated to `max_size` bytes, on a character boundary.
+/// The characters rejected by Cumulocity are removed by [`fail_operation_with_id`],
+/// using [`strip_control_chars`].
+///
+/// [`fail_operation_with_id`]: crate::smartrest::smartrest_serializer::fail_operation_with_id
+/// [`strip_control_chars`]: tedge_utils::control_chars::strip_control_chars
 pub fn get_failure_reason_for_smartrest(input: &[u8], max_size: usize) -> String {
     let input_string = std::str::from_utf8(input).unwrap_or_else(|err| {
         error!("The input contains invalid UTF-8: {err}");
@@ -70,8 +60,8 @@ pub fn get_failure_reason_for_smartrest(input: &[u8], max_size: usize) -> String
     });
     let last_line = input_string.trim_end().lines().last().unwrap_or_default();
     match input_string.lines().count() {
-        0 | 1 => sanitize_for_smartrest(last_line, max_size),
-        _ => sanitize_for_smartrest(&format!("{last_line}\n\n{input_string}"), max_size),
+        0 | 1 => truncate_for_smartrest(last_line, max_size),
+        _ => truncate_for_smartrest(&format!("{last_line}\n\n{input_string}"), max_size),
     }
 }
 
@@ -165,31 +155,6 @@ mod tests {
     }
 
     #[test]
-    fn selected_control_chars_remain() {
-        let input = b"\0\t\n\r";
-        let sanitized = sanitize_bytes_for_smartrest(input, MAX_PAYLOAD_LIMIT_IN_BYTES);
-        assert_eq!(sanitized, "\t\n\r".to_string());
-    }
-
-    #[test]
-    fn control_chars_are_removed() {
-        let input: Vec<u8> = (0x00..=0x7f).collect();
-        let sanitized = sanitize_bytes_for_smartrest(&input, MAX_PAYLOAD_LIMIT_IN_BYTES);
-        assert_eq!(
-            sanitized,
-            "\t\n\r !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
-        );
-    }
-
-    #[test]
-    fn invalid_utf8_is_contained() {
-        let invalid_sparkle_heart = vec![0, 159, 146, 150];
-        let sanitized =
-            sanitize_bytes_for_smartrest(&invalid_sparkle_heart, MAX_PAYLOAD_LIMIT_IN_BYTES);
-        assert_eq!(sanitized, "");
-    }
-
-    #[test]
     fn invalid_utf8_is_contained_last_line() {
         let invalid_sparkle_heart = vec![0, 159, 146, 150];
         let last_line =
@@ -198,20 +163,19 @@ mod tests {
     }
 
     #[test_case("foo bar baz\n", "foo bar baz\n"; "standard")]
-    #[test_case("foo\r\nbar\tbaz\0\"", "foo\r\nbar\tbaz\""; "with control chars")]
+    #[test_case("foo\r\nbar\tbaz\0\"", "foo\r\nbar\tbaz\0\""; "control chars are kept")]
     #[test_case("baz", "baz"; "no new line")]
     #[test_case("", ""; "empty")]
     #[test_case("こんにちは", "こんにちは"; "no ascii")]
-    #[test_case("こんにちは\"\n\0こんにちは", "こんにちは\"\nこんにちは"; "no ascii and control chars")]
-    fn u8_vec_is_sanitized(input: &str, expected_output: &str) {
-        let sanitized = sanitize_for_smartrest(input, MAX_PAYLOAD_LIMIT_IN_BYTES);
-        assert_eq!(sanitized, expected_output.to_string());
+    fn u8_vec_is_truncated(input: &str, expected_output: &str) {
+        let truncated = truncate_for_smartrest(input, MAX_PAYLOAD_LIMIT_IN_BYTES);
+        assert_eq!(truncated, expected_output.to_string());
     }
 
     #[test_case("foo bar bye", "foo bar by"; "ascii")]
     #[test_case("こんにちは", "こんに"; "no ascii")]
     fn size_u8_vec_is_stripped(input: &str, expected_output: &str) {
-        let stripped = sanitize_for_smartrest(input, 10);
+        let stripped = truncate_for_smartrest(input, 10);
         assert_eq!(stripped, expected_output.to_string());
     }
     #[test_case("baz\n", "baz"; "one line")]

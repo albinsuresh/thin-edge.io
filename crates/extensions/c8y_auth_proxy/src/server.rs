@@ -14,6 +14,7 @@ use axum_tls::config::load_ssl_config;
 use axum_tls::config::PemReader;
 use axum_tls::config::TrustStoreLoader;
 use axum_tls::start_tls_server;
+use c8y_api::domain_names::CertificateMonitor;
 use certificate::CloudHttpConfig;
 use futures::future::BoxFuture;
 use futures::FutureExt;
@@ -22,11 +23,11 @@ use futures::SinkExt;
 use futures::Stream;
 use futures::StreamExt;
 use http_body::Frame;
-use http_body_util::Full;
 use http_body_util::StreamBody;
 use hyper::header::AUTHORIZATION;
 use hyper::header::HOST;
 use hyper::HeaderMap;
+use reqwest::tls::TlsInfo;
 use reqwest::Method;
 use reqwest::StatusCode;
 use std::error::Error;
@@ -35,6 +36,7 @@ use std::io;
 use std::net::IpAddr;
 use std::net::TcpListener;
 use std::sync::Arc;
+use std::time::Duration;
 use tedge_config_macros::OptionalConfig;
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -45,7 +47,16 @@ use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
 use tracing::error;
 use tracing::info;
+use tracing::warn;
 use tracing::Instrument;
+
+/// How long an idle connection to Cumulocity is kept for reuse
+///
+/// Cumulocity closes connections which have been idle for 60 seconds.
+/// Expiring them before that avoids sending a request on a connection
+/// which Cumulocity is closing at the same time.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(50);
+const _: () = assert!(POOL_IDLE_TIMEOUT.as_secs() < 60);
 
 pub struct Server {
     fut: BoxFuture<'static, std::io::Result<()>>,
@@ -137,6 +148,7 @@ pub(crate) struct AppData {
     pub host: String,
     pub token_manager: SharedTokenManager,
     pub client: reqwest::Client,
+    pub certificate_monitor: CertificateMonitor,
 }
 
 #[derive(Clone)]
@@ -144,6 +156,7 @@ struct AppState {
     target_host: TargetHost,
     client: reqwest::Client,
     token_manager: SharedTokenManager,
+    certificate_monitor: CertificateMonitor,
 }
 
 impl From<AppData> for AppState {
@@ -162,6 +175,7 @@ impl From<AppData> for AppState {
             },
             token_manager: value.token_manager,
             client: value.client,
+            certificate_monitor: value.certificate_monitor,
         }
     }
 }
@@ -181,6 +195,12 @@ impl FromRef<AppState> for SharedTokenManager {
 impl FromRef<AppState> for reqwest::Client {
     fn from_ref(input: &AppState) -> Self {
         input.client.clone()
+    }
+}
+
+impl FromRef<AppState> for CertificateMonitor {
+    fn from_ref(input: &AppState) -> Self {
+        input.certificate_monitor.clone()
     }
 }
 
@@ -396,11 +416,41 @@ where
     Ok(None)
 }
 
+/// Does this request target the Cumulocity frontend UI?
+///
+/// Cumulocity revokes the device token when the frontend UI is accessed, so
+/// these requests are denied before they are proxied.
+//
+/// We can't just allow API requests and deny everything else, because there is
+/// no sensible common API prefix for the different endpoints like
+/// `https://<TENANT_DOMAIN>/event`, `<TENANT_DOMAIN>/inventory`,
+/// `TENANT_DOMAIN/devicecontrol`, etc. and new APIs can get added so we can
+/// only try to deny frontend requests by checking the request path after
+/// canonicalizing it.
+fn targets_frontend_ui(destination: &reqwest::Url) -> bool {
+    let decoded = percent_encoding::percent_decode_str(destination.path()).decode_utf8_lossy();
+
+    // Resolve the decoded path again, since decoding re-introduces separators and
+    // dot segments. `set_path` parses only a path: `.` and `..` are resolved as in the
+    // first parse, while `?` and `#` stay in the path (re-encoded) rather than being
+    // read as a query or a fragment, and the host can never change.
+    let mut normalized = destination.clone();
+    normalized.set_path(&decoded);
+
+    let path = normalized
+        .path()
+        .trim_start_matches('/')
+        .to_ascii_lowercase();
+
+    path.starts_with("apps/") || path.ends_with(".js")
+}
+
 #[allow(clippy::too_many_arguments)]
 #[axum::debug_handler(state = AppState)]
 async fn respond_to(
     State(host): State<TargetHost>,
     State(client): State<reqwest::Client>,
+    State(certificate_monitor): State<CertificateMonitor>,
     retrieve_token: State<SharedTokenManager>,
     uri: hyper::Uri,
     method: Method,
@@ -424,15 +474,18 @@ async fn respond_to(
         };
     headers.remove(HOST);
 
-    // Cumulocity revokes the device token if we access parts of the frontend UI,
-    // so deny requests to these proactively
-    if path.ends_with(".js") || path.starts_with("apps/") {
-        return Ok(StatusCode::FORBIDDEN.into_response());
-    }
     let mut destination = format!("{}/{path}", host.http);
     if let Some(query) = uri.query() {
         destination += "?";
         destination += query;
+    }
+    let destination = reqwest::Url::parse(&destination)
+        .with_context(|| format!("parsing the URL of the proxied request: {destination}"))?;
+
+    // Cumulocity revokes the device token if we access parts of the frontend UI,
+    // so deny requests to these proactively
+    if targets_frontend_ui(&destination) {
+        return Ok(StatusCode::FORBIDDEN.into_response());
     }
 
     let mut token = retrieve_token
@@ -441,18 +494,24 @@ async fn respond_to(
         .with_context(|| "failed to retrieve JWT token")?;
 
     if let Ok(ws) = ws {
-        let path = path.to_owned();
+        // Send the path that was checked, not the raw one
+        let path = destination
+            .path()
+            .strip_prefix('/')
+            .unwrap_or_default()
+            .to_owned();
         return Ok(ws.on_upgrade(|socket| proxy_ws(socket, host, retrieve_token, headers, path)));
     }
     let (body, body_clone) = small_body.try_clone();
     if body_clone.is_none() {
         let destination = format!("{}/tenant/currentTenant", host.http);
-        let response = client
-            .head(&destination)
-            .header(AUTHORIZATION, token.to_string())
-            .send()
-            .await
-            .with_context(|| format!("making HEAD request to {destination}"))?;
+        let response = resend_if_closed(true, || {
+            client
+                .head(&destination)
+                .header(AUTHORIZATION, token.to_string())
+        })
+        .await
+        .with_context(|| format!("making HEAD request to {destination}"))?;
         if response.status() == StatusCode::UNAUTHORIZED {
             token = retrieve_token
                 .not_matching(Some(&token))
@@ -461,19 +520,29 @@ async fn respond_to(
         }
     }
 
-    let send_request = |body, token: &str| {
+    let build_request = |body, token: &str| {
         auth(
             client
-                .request(method.to_owned(), &destination)
+                .request(method.to_owned(), destination.clone())
                 .headers(headers.clone()),
             token,
         )
         .body(body)
-        .send()
     };
-    let mut res = send_request(reqwest::Body::wrap(body), &token)
-        .await
-        .with_context(|| format!("making proxied request to {destination}"))?;
+    let mut res = match &body_clone {
+        Some(body) => {
+            resend_if_closed(method.is_idempotent(), || {
+                build_request(body.clone().into(), &token)
+            })
+            .await
+        }
+        None => {
+            build_request(reqwest::Body::wrap(body), &token)
+                .send()
+                .await
+        }
+    }
+    .with_context(|| format!("making proxied request to {destination}"))?;
 
     if res.status() == StatusCode::UNAUTHORIZED {
         token = retrieve_token
@@ -481,32 +550,81 @@ async fn respond_to(
             .await
             .with_context(|| "failed to retrieve JWT token")?;
         if let Some(body) = body_clone {
-            res = send_request(body.into(), &token)
-                .await
-                .with_context(|| format!("making proxied request to {destination}"))?;
+            res = resend_if_closed(method.is_idempotent(), || {
+                build_request(body.clone().into(), &token)
+            })
+            .await
+            .with_context(|| format!("making proxied request to {destination}"))?;
         }
     }
-    let te_header = res.headers_mut().remove("transfer-encoding");
+    if let Some(certificate) = res
+        .extensions()
+        .get::<TlsInfo>()
+        .and_then(TlsInfo::peer_certificate)
+    {
+        certificate_monitor.seen(certificate);
+    }
+    // The framing of the response to the client is decided by hyper: it uses the
+    // forwarded Content-Length header if there is one, and chunked encoding otherwise
+    res.headers_mut().remove("transfer-encoding");
     let status = res.status();
     let headers = std::mem::take(res.headers_mut());
 
-    let body = if te_header.is_some_and(|h| h.to_str().unwrap_or_default().contains("chunked")) {
-        axum::body::Body::new(StreamBody::new(
-            res.bytes_stream().map(|b| b.map(Frame::data)),
-        ))
-    } else {
-        axum::body::Body::new(Full::new(
-            res.bytes().await.context("reading proxy response bytes")?,
-        ))
-    };
+    // Always stream the response body, so large downloads are not held in memory
+    let body = axum::body::Body::new(StreamBody::new(
+        res.bytes_stream().map(|b| b.map(Frame::data)),
+    ));
 
     Ok((status, headers, body).into_response())
+}
+
+/// Sends a request, and sends it again if the connection was closed before a response was received
+///
+/// This happens when Cumulocity closes a pooled connection just as it is reused.
+async fn resend_if_closed(
+    can_resend: bool,
+    request: impl Fn() -> reqwest::RequestBuilder,
+) -> reqwest::Result<reqwest::Response> {
+    match request().send().await {
+        Err(err) if can_resend && is_connection_closed(&err) => {
+            warn!("Connection to Cumulocity closed before receiving a response, sending the request again: {err:?}");
+            request().send().await
+        }
+        res => res,
+    }
+}
+
+/// Whether the request failed because the connection was closed before a response was received
+fn is_connection_closed(err: &reqwest::Error) -> bool {
+    let mut source = err.source();
+    while let Some(err) = source {
+        if let Some(err) = err.downcast_ref::<hyper::Error>() {
+            if err.is_incomplete_message() {
+                return true;
+            }
+        }
+        if let Some(err) = err.downcast_ref::<io::Error>() {
+            if matches!(
+                err.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::ConnectionAborted
+                    | io::ErrorKind::BrokenPipe
+            ) {
+                return true;
+            }
+        }
+        source = err.source();
+    }
+    false
 }
 
 pub fn remote_reqwest_client(config: &CloudHttpConfig) -> reqwest::Client {
     config
         .client_builder()
+        .tls_info(true)
         .set_user_agent(false)
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
         .build()
         .expect("Valid reqwest client builder configuration")
 }
@@ -536,10 +654,15 @@ mod tests {
     use std::future::IntoFuture;
     use std::net::Ipv4Addr;
     use std::net::SocketAddr;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+    use tokio::io::AsyncRead;
     use tokio::io::AsyncReadExt;
+    use tokio::io::AsyncWrite;
     use tokio::io::AsyncWriteExt;
     use tokio::net::TcpStream;
+    use tokio::sync::watch;
     use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
     use tokio_tungstenite::tungstenite::protocol::CloseFrame;
     use tokio_tungstenite::tungstenite::Message;
@@ -835,6 +958,228 @@ mod tests {
         );
     }
 
+    /// The URL the handler builds, so the denylist is exercised on exactly the value
+    /// `respond_to` checks.
+    fn proxied_url(raw_path: &str) -> reqwest::Url {
+        reqwest::Url::parse(&format!("https://tenant.cumulocity.com/{raw_path}")).unwrap()
+    }
+
+    #[rstest::rstest]
+    #[case::plain_frontend_app("apps/foo")]
+    #[case::plain_script("foo.js")]
+    #[case::nested_script("some/nested/script.js")]
+    // `.` and `..` segments are resolved by `Url::parse`, so a check on the raw path
+    // would let these through and Cumulocity would still see `/apps/...`.
+    #[case::frontend_app_behind_parent_segments("../../apps/foo")]
+    #[case::frontend_app_behind_a_current_directory_segment("./apps/foo")]
+    #[case::frontend_app_behind_a_sibling_segment("foo/../apps/bar")]
+    #[case::script_behind_parent_segments("a/b/../../foo.js")]
+    // A decoding server would see these as the frontend UI, so a check on the raw path
+    // would miss them.
+    #[case::frontend_app_with_an_encoded_letter("app%73/foo")]
+    #[case::frontend_app_with_an_encoded_slash("apps%2Ffoo")]
+    #[case::script_with_an_encoded_dot("foo%2Ejs")]
+    // Decoding re-introduces separators and dot segments that the first resolution
+    // already removed, so the decoded path has to be resolved again.
+    #[case::frontend_app_behind_an_encoded_parent_segment("..%2Fapps/foo")]
+    #[case::frontend_app_behind_encoded_parent_segments("..%2F..%2Fapps/foo")]
+    #[case::frontend_app_behind_lower_case_encoded_parent_segments("a/..%2f..%2fapps/foo")]
+    #[case::frontend_app_behind_a_fully_encoded_path("a%2F..%2F..%2Fapps%2Ffoo")]
+    #[case::script_behind_an_encoded_parent_segment("..%2Ffoo.js")]
+    // The URL standard treats `\` as a path separator for a special scheme, so these
+    // decode to a path that resolves to `/apps/...` or ends in `.js`.
+    #[case::frontend_app_behind_an_encoded_backslash("%5Capps/foo")]
+    #[case::frontend_app_behind_encoded_backslashes("%5C%5Capps/foo")]
+    #[case::frontend_app_behind_mixed_encoded_separators("%2F%5Capps/foo")]
+    #[case::frontend_app_behind_an_encoded_parent_segment_and_backslash("..%2F%5Capps/foo")]
+    #[case::script_behind_an_encoded_backslash("%5Cfoo.js")]
+    // Tab, CR and LF are dropped when the decoded path is parsed, so they cannot hide
+    // the separators that follow them.
+    #[case::frontend_app_behind_a_tab_and_an_encoded_backslash("%09%5Capps/foo")]
+    #[case::frontend_app_behind_a_tab_and_a_separator("%09/apps/foo")]
+    #[case::frontend_app_behind_a_newline_and_an_encoded_backslash("%0A%5Capps/foo")]
+    #[case::frontend_app_behind_a_carriage_return_and_an_encoded_backslash("%0D%5Capps/foo")]
+    // A decoded `?` or `#` must stay part of the path, or everything after it would be
+    // read as a query or a fragment and escape the check.
+    #[case::frontend_app_behind_an_encoded_question_mark("x%3F/..%2Fapps/foo")]
+    #[case::frontend_app_behind_an_encoded_hash("x%23/..%2Fapps/foo")]
+    #[case::script_behind_an_encoded_question_mark("x%3F/..%2Ffoo.js")]
+    #[case::script_with_an_encoded_question_mark("x%3F.js")]
+    // Casing
+    #[case::frontend_app_in_upper_case("APPS/foo")]
+    #[case::script_in_upper_case("foo.JS")]
+    // A leading empty segment still resolves to the frontend UI
+    #[case::frontend_app_behind_an_empty_segment("/apps/foo")]
+    fn requests_to_the_frontend_ui_are_denied(#[case] raw_path: &str) {
+        assert!(
+            targets_frontend_ui(&proxied_url(raw_path)),
+            "{raw_path:?} should have been recognised as a frontend UI request"
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::empty_path("")]
+    #[case::inventory("inventory/managedObjects")]
+    #[case::current_tenant("tenant/currentTenant")]
+    #[case::measurements("measurement/measurements")]
+    #[case::a_path_merely_containing_apps("service/applications")]
+    #[case::apps_below_another_segment("inventory/apps/foo")]
+    #[case::a_json_document("foo.json")]
+    #[case::a_path_containing_but_not_ending_in_js("foo.js.txt")]
+    #[case::an_encoded_slash_inside_an_identifier("identity/externalIds/c8y_Serial%2F123")]
+    #[case::an_encoded_backslash_before_an_api_path("%5Cinventory/managedObjects")]
+    #[case::an_encoded_question_mark_inside_an_identifier("identity/externalIds/c8y_Serial%3F123")]
+    fn ordinary_api_requests_are_not_denied(#[case] raw_path: &str) {
+        assert!(
+            !targets_frontend_ui(&proxied_url(raw_path)),
+            "{raw_path:?} should have been proxied"
+        );
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Upgrade {
+        None,
+        WebSocket,
+    }
+
+    /// Drive a raw request line through the proxy
+    ///
+    /// Returns the head of the proxy's response and the request line that reached the
+    /// upstream, if the proxy forwarded anything at all.
+    async fn raw_request(request_target: &str, upgrade: Upgrade) -> (String, Option<String>) {
+        let upstream = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let proxy_port = start_plain_http_proxy(upstream.local_addr().unwrap().port()).await;
+
+        let (mut forwarded_tx, mut forwarded_rx) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Ok((mut upstream, _)) = upstream.accept().await {
+                let mut received = Vec::new();
+                let _ = upstream.read_buf(&mut received).await;
+                let _ = upstream.write_all(b"HTTP/1.1 204 No Content\r\n\r\n").await;
+                let request_line = String::from_utf8_lossy(&received)
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                let _ = forwarded_tx.send(request_line).await;
+            }
+        });
+
+        let headers = match upgrade {
+            Upgrade::None => "Connection: close\r\n",
+            Upgrade::WebSocket => {
+                "Connection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+            }
+        };
+        let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, proxy_port))
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!("GET {request_target} HTTP/1.1\r\nHost: localhost\r\n{headers}\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+
+        // An upgraded connection stays open, so read only the response head rather than
+        // waiting for the proxy to close the connection.
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !response.windows(4).any(|w| w == b"\r\n\r\n") {
+                if stream.read_buf(&mut response).await.unwrap() == 0 {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for the proxy to respond");
+
+        // The proxy answers a denied request without touching the network, so anything
+        // it did forward has already been sent by the time it replies, or, for an
+        // upgrade, is sent straight after. The bounded wait covers that handover.
+        let forwarded = tokio::time::timeout(Duration::from_secs(1), forwarded_rx.next())
+            .await
+            .ok()
+            .flatten();
+
+        (String::from_utf8_lossy(&response).into_owned(), forwarded)
+    }
+
+    // End-to-end proof over a raw socket. A normal HTTP client resolves `..` before the
+    // request leaves, so the bypasses can only be reproduced by writing the request line
+    // directly. A websocket upgrade is proxied by a separate branch, so each case is
+    // also sent as an upgrade.
+    #[rstest::rstest]
+    #[case::plain_frontend_app("/c8y/apps/foo")]
+    #[case::frontend_app_behind_parent_segments("/c8y/../../apps/foo")]
+    #[case::frontend_app_with_an_encoded_letter("/c8y/app%73/foo")]
+    #[case::script_with_an_encoded_dot("/c8y/foo%2Ejs")]
+    #[case::frontend_app_behind_an_encoded_parent_segment("/c8y/..%2Fapps/foo")]
+    #[case::frontend_app_behind_lower_case_encoded_parent_segments("/c8y/a/..%2f..%2fapps/foo")]
+    #[case::frontend_app_behind_an_encoded_backslash("/c8y/%5Capps/foo")]
+    #[case::frontend_app_behind_a_tab_and_an_encoded_backslash("/c8y/%09%5Capps/foo")]
+    #[case::frontend_app_behind_an_encoded_question_mark("/c8y/x%3F/..%2Fapps/foo")]
+    #[tokio::test]
+    async fn frontend_ui_requests_do_not_reach_cumulocity(
+        #[case] request_target: &str,
+        #[values(Upgrade::None, Upgrade::WebSocket)] upgrade: Upgrade,
+    ) {
+        let (response, forwarded) = raw_request(request_target, upgrade).await;
+
+        assert!(
+            response.starts_with("HTTP/1.1 403 Forbidden"),
+            "expected 403 for {request_target:?}, got: {response}"
+        );
+        assert_eq!(
+            forwarded, None,
+            "{request_target:?} was forwarded to Cumulocity instead of being denied"
+        );
+    }
+
+    // Positive control: proves the harness above can actually observe a forwarded
+    // request, so asserting that nothing was forwarded is not vacuous. It also checks
+    // that what is forwarded is the path that was checked, not the raw path.
+    #[rstest::rstest]
+    #[case::api_path("/c8y/inventory/managedObjects", "/inventory/managedObjects")]
+    #[case::api_path_behind_a_resolved_frontend_segment("/c8y/apps/../inventory", "/inventory")]
+    #[tokio::test]
+    async fn ordinary_requests_are_forwarded_to_cumulocity(
+        #[case] request_target: &str,
+        #[case] expected_path: &str,
+        #[values(Upgrade::None, Upgrade::WebSocket)] upgrade: Upgrade,
+    ) {
+        let (_response, forwarded) = raw_request(request_target, upgrade).await;
+
+        assert_eq!(
+            forwarded,
+            Some(format!("GET {expected_path} HTTP/1.1")),
+            "{request_target:?} was not forwarded as the path that was checked"
+        );
+    }
+
+    /// Serve the proxy over plain HTTP so that a test can write a raw request line to it
+    ///
+    /// The TLS harness used by the other tests cannot be driven from a bare socket, and
+    /// an HTTP client would resolve `.` and `..` before the request ever left.
+    async fn start_plain_http_proxy(target_port: u16) -> u16 {
+        let state = AppData {
+            is_https: false,
+            host: format!("127.0.0.1:{target_port}"),
+            token_manager: IterJwtRetriever::new(vec!["a token"]).shared(),
+            client: remote_reqwest_client(&CloudHttpConfig::new([], None)),
+            certificate_monitor: CertificateMonitor::new(watch::channel(()).0.into()),
+        };
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(axum::serve(listener, create_app(state).into_make_service()).into_future());
+        port
+    }
+
     async fn axum_server() -> (tokio::net::TcpListener, u16) {
         for port in 3200..3300 {
             let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), port);
@@ -1024,6 +1369,7 @@ mod tests {
             vec!["test-token"],
             rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap(),
             None,
+            None,
         );
 
         let res = reqwest_client()
@@ -1143,6 +1489,236 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn requests_domain_name_detection_when_it_sees_the_cumulocity_certificate() {
+        let target_certificate =
+            rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
+        let config = axum_tls::ssl_config(
+            vec![target_certificate.cert.der().clone()],
+            PrivateKeyDer::from_pem_slice(
+                target_certificate.signing_key.serialize_pem().as_bytes(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let (tcp_stream, _) = listener.accept().await.unwrap();
+            let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+            answer_requests_until_second(&mut tls_stream, &AtomicUsize::new(0)).await;
+        });
+        let (refresh, refresh_requests) = watch::channel(());
+        let port = start_proxy_with_certificate_monitor(
+            &format!("127.0.0.1:{target_port}"),
+            vec!["test-token"],
+            rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap(),
+            None,
+            Some(reqwest::Certificate::from_der(target_certificate.cert.der()).unwrap()),
+            CertificateMonitor::new(refresh.into()),
+        );
+
+        let res = reqwest_client()
+            .get(format!(
+                "https://localhost:{port}/c8y/inventory/managedObjects"
+            ))
+            .send()
+            .await
+            .unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert!(refresh_requests.has_changed().unwrap());
+    }
+
+    #[rstest::rstest]
+    #[case::closed_gracefully(CloseConnection::Gracefully)]
+    #[case::reset(CloseConnection::WithReset)]
+    #[case::tls_with_close_notify(CloseConnection::TlsWithCloseNotify)]
+    #[case::tls_without_close_notify(CloseConnection::TlsWithoutCloseNotify)]
+    #[tokio::test]
+    #[timeout(Duration::from_secs(30))]
+    async fn resends_idempotent_requests_if_cumulocity_closes_the_connection(
+        #[case] close: CloseConnection,
+    ) {
+        let (port, received_requests) = start_proxy_to_target_dropping_second_request(close).await;
+        let url = format!("https://localhost:{port}/c8y/identity/externalIds/c8y_Serial/test");
+
+        let res = reqwest_client().get(&url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let res = reqwest_client().get(&url).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+
+        assert_eq!(received_requests.load(Ordering::SeqCst), 3);
+    }
+
+    #[rstest::rstest]
+    #[case::closed_gracefully(CloseConnection::Gracefully)]
+    #[case::reset(CloseConnection::WithReset)]
+    #[case::tls_with_close_notify(CloseConnection::TlsWithCloseNotify)]
+    #[case::tls_without_close_notify(CloseConnection::TlsWithoutCloseNotify)]
+    #[tokio::test]
+    #[timeout(Duration::from_secs(30))]
+    async fn does_not_resend_post_requests_if_cumulocity_closes_the_connection(
+        #[case] close: CloseConnection,
+    ) {
+        let (port, received_requests) = start_proxy_to_target_dropping_second_request(close).await;
+        let url = format!("https://localhost:{port}/c8y/service/test/evaluate");
+
+        let res = reqwest_client().post(&url).body("{}").send().await.unwrap();
+        assert_eq!(res.status(), 200);
+        let res = reqwest_client().post(&url).body("{}").send().await.unwrap();
+        assert_eq!(res.status(), 502);
+
+        assert_eq!(received_requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn connection_refused_is_not_treated_as_a_closed_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        let err = reqwest_client()
+            .get(format!("http://127.0.0.1:{port}"))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(!is_connection_closed(&err));
+    }
+
+    #[derive(Clone, Copy)]
+    enum CloseConnection {
+        Gracefully,
+        WithReset,
+        /// What Cumulocity does when a connection has been idle for 60 seconds
+        TlsWithCloseNotify,
+        TlsWithoutCloseNotify,
+    }
+
+    /// Starts a proxy to a target which answers every request except the second one it receives,
+    /// for which it closes the connection without answering
+    ///
+    /// This is what happens when a pooled connection is reused just as
+    /// Cumulocity closes it for being idle for too long.
+    async fn start_proxy_to_target_dropping_second_request(
+        close: CloseConnection,
+    ) -> (u16, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = listener.local_addr().unwrap().port();
+        let received_requests = Arc::new(AtomicUsize::new(0));
+        let counter = received_requests.clone();
+
+        let (tls_acceptor, target_ca) = match close {
+            CloseConnection::TlsWithCloseNotify | CloseConnection::TlsWithoutCloseNotify => {
+                let certificate =
+                    rcgen::generate_simple_self_signed(["127.0.0.1".to_owned()]).unwrap();
+                let config = axum_tls::ssl_config(
+                    vec![certificate.cert.der().clone()],
+                    PrivateKeyDer::from_pem_slice(
+                        certificate.signing_key.serialize_pem().as_bytes(),
+                    )
+                    .unwrap(),
+                    None,
+                )
+                .unwrap();
+                let ca = reqwest::Certificate::from_der(certificate.cert.der()).unwrap();
+                (
+                    Some(tokio_rustls::TlsAcceptor::from(Arc::new(config))),
+                    Some(ca),
+                )
+            }
+            CloseConnection::Gracefully | CloseConnection::WithReset => (None, None),
+        };
+
+        tokio::spawn(async move {
+            loop {
+                let (tcp_stream, _) = listener.accept().await.unwrap();
+                let counter = counter.clone();
+                let tls_acceptor = tls_acceptor.clone();
+                tokio::spawn(async move {
+                    match (close, tls_acceptor) {
+                        (CloseConnection::Gracefully, _) => {
+                            let mut tcp_stream = tcp_stream;
+                            answer_requests_until_second(&mut tcp_stream, &counter).await;
+                        }
+                        (CloseConnection::WithReset, _) => {
+                            let mut tcp_stream = tcp_stream;
+                            answer_requests_until_second(&mut tcp_stream, &counter).await;
+                            tcp_stream.set_zero_linger().unwrap();
+                        }
+                        (CloseConnection::TlsWithCloseNotify, Some(acceptor)) => {
+                            let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+                            answer_requests_until_second(&mut tls_stream, &counter).await;
+                            let _ = tls_stream.shutdown().await;
+                        }
+                        (CloseConnection::TlsWithoutCloseNotify, Some(acceptor)) => {
+                            let mut tls_stream = acceptor.accept(tcp_stream).await.unwrap();
+                            answer_requests_until_second(&mut tls_stream, &counter).await;
+                        }
+                        (_, None) => unreachable!("TLS cases always have an acceptor"),
+                    }
+                });
+            }
+        });
+
+        let port = start_proxy_to_url(
+            &format!("127.0.0.1:{target_port}"),
+            vec!["test-token"],
+            rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap(),
+            None,
+            target_ca,
+        );
+        (port, received_requests)
+    }
+
+    /// Answers requests on a connection until the target has received its second request overall
+    async fn answer_requests_until_second(
+        stream: &mut (impl AsyncRead + AsyncWrite + Unpin),
+        received_requests: &AtomicUsize,
+    ) {
+        while read_complete_request(stream).await {
+            if received_requests.fetch_add(1, Ordering::SeqCst) == 1 {
+                return;
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+    }
+
+    /// Reads an HTTP request including its body, which may arrive in several reads
+    ///
+    /// Returns `false` if the connection is closed before a complete request is received.
+    async fn read_complete_request(stream: &mut (impl AsyncRead + Unpin)) -> bool {
+        let mut request = Vec::with_capacity(10000);
+        loop {
+            if stream.read_buf(&mut request).await.unwrap_or(0) == 0 {
+                return false;
+            }
+            let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                continue;
+            };
+            let head = String::from_utf8_lossy(&request[..header_end]).to_lowercase();
+            let body = &request[header_end + 4..];
+            let content_length = head
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length:"))
+                .map(|len| len.trim().parse::<usize>().unwrap());
+            let complete = match content_length {
+                Some(len) => body.len() >= len,
+                None if head.contains("transfer-encoding: chunked") => body.ends_with(b"0\r\n\r\n"),
+                None => true,
+            };
+            if complete {
+                return true;
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn regenerates_token_proactively_if_the_request_cannot_be_retried() {
         let _ = env_logger::try_init();
         let mut server = mockito::Server::new_async().await;
@@ -1209,6 +1785,139 @@ mod tests {
         assert_eq!(res.bytes().await.unwrap(), Bytes::from("Succeeded"));
     }
 
+    #[tokio::test]
+    async fn forwards_large_responses_with_content_length() {
+        let _ = env_logger::try_init();
+        let body: Vec<u8> = (0..16 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/inventory/binaries/1234")
+            .match_header("Authorization", "Bearer test-token")
+            .with_status(200)
+            .with_header("Content-Type", "application/octet-stream")
+            .with_body(&body)
+            .create_async()
+            .await;
+
+        let port = start_server(&server, vec!["test-token"]);
+
+        let res = reqwest_client()
+            .get(format!(
+                "https://localhost:{port}/c8y/inventory/binaries/1234"
+            ))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let content_length = body.len().to_string();
+        assert_eq!(
+            res.headers().get("content-length").unwrap(),
+            content_length.as_str()
+        );
+        assert_eq!(res.headers().get("transfer-encoding"), None);
+        assert_eq!(
+            res.headers().get("content-type").unwrap(),
+            "application/octet-stream"
+        );
+        assert!(res.bytes().await.unwrap() == body);
+    }
+
+    #[tokio::test]
+    async fn streams_responses_with_content_length_before_they_are_complete() {
+        let _ = env_logger::try_init();
+        let target_host = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = target_host.local_addr().unwrap();
+        let proxy_port = start_server_port(target.port(), vec!["test-token"]);
+        let (first_part_received, wait_for_first_part) = tokio::sync::oneshot::channel();
+
+        let chunk = vec![b'a'; 64 * 1024];
+        let target_chunk = chunk.clone();
+        tokio::spawn(async move {
+            let (mut tcp_stream, _) = target_host.accept().await.unwrap();
+            parse_raw_request(&mut tcp_stream).await;
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                2 * target_chunk.len()
+            );
+            tcp_stream.write_all(headers.as_bytes()).await.unwrap();
+            tcp_stream.write_all(&target_chunk).await.unwrap();
+            // Only finish the body once the client has received the first part,
+            // so a proxy that buffers the whole response cannot respond in time
+            wait_for_first_part.await.unwrap();
+            tcp_stream.write_all(&target_chunk).await.unwrap();
+        });
+
+        let mut res = timeout(
+            reqwest_client()
+                .get(format!("https://localhost:{proxy_port}/c8y/test"))
+                .send(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(
+            res.headers().get("content-length").unwrap(),
+            (2 * chunk.len()).to_string().as_str()
+        );
+
+        let mut received = Vec::new();
+        while received.len() < chunk.len() {
+            received.extend(timeout(res.chunk()).await.unwrap().unwrap());
+        }
+        first_part_received.send(()).unwrap();
+        while let Some(bytes) = timeout(res.chunk()).await.unwrap() {
+            received.extend(bytes);
+        }
+        assert_eq!(received.len(), 2 * chunk.len());
+    }
+
+    #[test_case::test_case(None; "with proxy token")]
+    #[test_case::test_case(Some("Basic dXNlcjpwYXNz"); "with user supplied authorization")]
+    #[tokio::test]
+    async fn follows_redirects_without_forwarding_authorization_header(user_auth: Option<&str>) {
+        let _ = env_logger::try_init();
+        let mut storage = mockito::Server::new_async().await;
+        let storage_mock = storage
+            .mock("GET", "/bucket/firmware.bin")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "X-Amz-Signature".into(),
+                "abc".into(),
+            ))
+            .match_header("Authorization", mockito::Matcher::Missing)
+            .with_status(200)
+            .with_body("firmware contents")
+            .create_async()
+            .await;
+        // Use a different host name for the redirect target, as an S3 presigned URL would
+        let storage_url = format!(
+            "http://localhost:{}/bucket/firmware.bin?X-Amz-Signature=abc",
+            storage.socket_address().port()
+        );
+
+        let mut c8y = mockito::Server::new_async().await;
+        let expected_auth = user_auth.unwrap_or("Bearer test-token");
+        c8y.mock("GET", "/service/my-microservice/firmware")
+            .match_header("Authorization", expected_auth)
+            .with_status(307)
+            .with_header("Location", &storage_url)
+            .create_async()
+            .await;
+
+        let port = start_server(&c8y, vec!["test-token"]);
+
+        let mut req = reqwest_client().get(format!(
+            "https://localhost:{port}/c8y/service/my-microservice/firmware"
+        ));
+        if let Some(auth) = user_auth {
+            req = req.header("Authorization", auth);
+        }
+        let res = req.send().await.unwrap();
+
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.bytes().await.unwrap(), Bytes::from("firmware contents"));
+        storage_mock.assert_async().await;
+    }
+
     #[allow(clippy::disallowed_methods)]
     fn reqwest_client() -> reqwest::Client {
         reqwest_builder().build().unwrap()
@@ -1235,6 +1944,7 @@ mod tests {
             tokens,
             rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap(),
             None,
+            None,
         )
     }
 
@@ -1246,24 +1956,48 @@ mod tests {
     ) -> u16 {
         let url = target_host.url();
         let (_scheme, host) = url.split_once("://").unwrap();
-        start_proxy_to_url(host, tokens, certificate, ca_dir)
+        start_proxy_to_url(host, tokens, certificate, ca_dir, None)
     }
 
-    #[allow(clippy::disallowed_methods)]
     fn start_proxy_to_url(
         target_host: &str,
         tokens: Vec<impl Into<Cow<'static, str>>>,
         certificate: rcgen::CertifiedKey<rcgen::KeyPair>,
         ca_dir: Option<Utf8PathBuf>,
+        target_ca: Option<reqwest::Certificate>,
+    ) -> u16 {
+        let (refresh, _) = watch::channel(());
+        start_proxy_with_certificate_monitor(
+            target_host,
+            tokens,
+            certificate,
+            ca_dir,
+            target_ca,
+            CertificateMonitor::new(refresh.into()),
+        )
+    }
+
+    #[allow(clippy::disallowed_methods)]
+    fn start_proxy_with_certificate_monitor(
+        target_host: &str,
+        tokens: Vec<impl Into<Cow<'static, str>>>,
+        certificate: rcgen::CertifiedKey<rcgen::KeyPair>,
+        ca_dir: Option<Utf8PathBuf>,
+        target_ca: Option<reqwest::Certificate>,
+        certificate_monitor: CertificateMonitor,
     ) -> u16 {
         let jwt_retriever = IterJwtRetriever::new(tokens).shared();
         let mut last_error = None;
         for port in 3000..3100 {
             let state = AppData {
-                is_https: false,
+                is_https: target_ca.is_some(),
                 host: target_host.into(),
                 token_manager: jwt_retriever.clone(),
-                client: remote_reqwest_client(&CloudHttpConfig::new([], None)),
+                client: remote_reqwest_client(&CloudHttpConfig::new(
+                    target_ca.iter().cloned().collect::<Vec<_>>(),
+                    None,
+                )),
+                certificate_monitor: certificate_monitor.clone(),
             };
             let trust_store = ca_dir
                 .as_ref()

@@ -4,12 +4,14 @@ use crate::operation_workflows::builder::UploaderRequest;
 use crate::operation_workflows::builder::UploaderResult;
 use crate::operation_workflows::builder::WorkflowActorBuilder;
 use crate::operation_workflows::config::OperationConfig;
+use crate::operation_workflows::entity_store_client::EntityStoreClient;
 use crate::software_manager::actor::SoftwareCommand;
 use crate::Capabilities;
 use serde_json::json;
 use std::process::Output;
 use std::sync::Arc;
 use std::time::Duration;
+use tedge_actors::test_helpers::FakeServerBox;
 use tedge_actors::test_helpers::MessageReceiverExt;
 use tedge_actors::test_helpers::TimedMessageBox;
 use tedge_actors::Actor;
@@ -37,6 +39,10 @@ use tedge_api::commands::SoftwareModuleAction;
 use tedge_api::commands::SoftwareModuleItem;
 use tedge_api::commands::SoftwareRequestResponseSoftwareList;
 use tedge_api::commands::SoftwareUpdateCommandPayload;
+use tedge_api::entity::EntityMetadata;
+use tedge_api::entity::EntityType;
+use tedge_api::http_url::EntityStoreUrls;
+use tedge_api::http_url::Protocol;
 use tedge_api::mqtt_topics::EntityTopicId;
 use tedge_api::mqtt_topics::MqttSchema;
 use tedge_api::mqtt_topics::OperationType;
@@ -48,18 +54,26 @@ use tedge_api::workflow::OperationStep;
 use tedge_api::workflow::OperationStepHandler;
 use tedge_api::workflow::OperationStepRequest;
 use tedge_api::workflow::OperationStepResponse;
+use tedge_api::workflow::OperationWorkflows;
 use tedge_api::workflow::SyncOnCommand;
 use tedge_api::RestartCommand;
 use tedge_api::SoftwareUpdateCommand;
+use tedge_config::SudoCommandBuilder;
+use tedge_config::SudoResolution;
 use tedge_downloader_ext::DownloadResponse;
 use tedge_file_system_ext::FsWatchEvent;
+use tedge_http_ext::test_helpers::HttpResponseBuilder;
+use tedge_http_ext::HttpRequest;
+use tedge_http_ext::HttpResult;
 use tedge_mqtt_ext::test_helpers::assert_received_contains_str;
 use tedge_mqtt_ext::MqttMessage;
 use tedge_mqtt_ext::Topic;
 use tedge_script_ext::Execute;
+use tedge_test_utils::fs::with_exec_permission;
 use tedge_test_utils::fs::TempTedgeDir;
 use tedge_uploader_ext::UploadResponse;
 use tedge_utils::paths::TedgePaths;
+use test_case::test_case;
 use tokio::task::JoinHandle;
 
 const TEST_TIMEOUT_MS: Duration = Duration::from_millis(3000);
@@ -1072,13 +1086,1241 @@ action = "cleanup"
     Ok(())
 }
 
+#[test]
+fn builtin_workflows_are_valid_operation_workflows() {
+    for (name, definition) in [
+        (
+            "device_profile.toml",
+            include_str!("../resources/device_profile.toml"),
+        ),
+        (
+            "shell_execute.toml",
+            include_str!("../resources/shell_execute.toml"),
+        ),
+        (
+            "service_control.toml",
+            include_str!("../resources/service_control.toml"),
+        ),
+    ] {
+        toml::from_str::<OperationWorkflows>(definition)
+            .unwrap_or_else(|err| panic!("{name} is not a valid workflow definition: {err}"));
+    }
+}
+
+#[tokio::test]
+async fn an_elevated_script_is_launched_through_sudo() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        tmp_dir.clone(),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::with_program("echo"),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope {
+        request,
+        mut reply_to,
+    } = recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+        .await
+        .expect("script request expected");
+    let SudoResolution::Sudo(echo) = SudoCommandBuilder::with_program("echo").resolve() else {
+        panic!("echo expected in $PATH");
+    };
+    assert_eq!(request.command, echo.as_str());
+    assert_eq!(
+        request.args,
+        ["-n", "--", "tedge", "service", "restart", "nginx"]
+    );
+    assert_eq!(
+        request.timeouts.map(|(graceful, _)| graceful),
+        Some(Duration::from_secs(60)),
+        "the timeout of the step applies to the elevated script"
+    );
+
+    reply_to
+        .send(Ok(script_output(
+            0,
+            ":::begin-tedge:::\n{\"elevated\": true}\n:::end-tedge:::\n",
+        )))
+        .await
+        .unwrap();
+
+    let payload = recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "successful",
+    )
+    .await;
+    assert_eq!(payload["elevated"], json!(true));
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(
+        log.contains("Action:   tedge service restart nginx (sudo = true)"),
+        "{log}"
+    );
+    assert!(
+        log.contains(&format!("----- $ {echo} -n -- tedge service restart nginx")),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn the_exit_code_of_an_elevated_script_reaches_the_handlers() {
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        Arc::new(TempTedgeDir::new()),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::with_program("echo"),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"reload","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope { mut reply_to, .. } =
+        recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+            .await
+            .expect("script request expected");
+    reply_to.send(Ok(script_output(2, ""))).await.unwrap();
+
+    let payload = recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "failed",
+    )
+    .await;
+    assert_eq!(payload["reason"], json!("not supported"));
+}
+
+#[tokio::test]
+async fn the_failure_reason_of_an_elevated_script_names_the_script_not_sudo() {
+    let tmp_dir = TempTedgeDir::new();
+    let sudo = tmp_dir.path().join("sudo");
+    // Allows only `tedge service restart nginx`, to check which command the agent asks sudo about
+    with_exec_permission(
+        &sudo,
+        "#!/bin/sh\n[ \"$*\" = \"-n --list -- tedge service restart nginx\" ]\n",
+    );
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        Arc::new(tmp_dir),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::with_program(sudo.as_str()),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope { mut reply_to, .. } =
+        recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+            .await
+            .expect("script request expected");
+    reply_to.send(Ok(script_output(1, ""))).await.unwrap();
+
+    let payload = recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "failed",
+    )
+    .await;
+    assert_eq!(payload["reason"], json!("tedge returned exit code 1"));
+}
+
+#[tokio::test]
+async fn the_failure_reason_names_sudo_when_sudo_refuses_the_script() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    // A sudo program that fails, both to run the script and to list it as allowed
+    let sudo = SudoCommandBuilder::with_program("false");
+    let SudoResolution::Sudo(sudo_program) = sudo.resolve() else {
+        panic!("false expected in $PATH");
+    };
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(tmp_dir.clone(), ELEVATED_SCRIPT_WORKFLOW, sudo).await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope { mut reply_to, .. } =
+        recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+            .await
+            .expect("script request expected");
+    reply_to.send(Ok(script_output(1, ""))).await.unwrap();
+
+    let payload = recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "failed",
+    )
+    .await;
+    assert_eq!(
+        payload["reason"],
+        json!(format!("{sudo_program} returned exit code 1"))
+    );
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(
+        log.contains("ERROR: sudo refused to run 'tedge': the command is not found, or not allowed by the sudoers rules"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn a_script_not_run_through_sudo_is_not_reported_as_refused() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        tmp_dir.clone(),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::enabled(false),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope { mut reply_to, .. } =
+        recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+            .await
+            .expect("script request expected");
+    reply_to.send(Ok(script_output(1, ""))).await.unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "failed",
+    )
+    .await;
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(!log.contains("sudo refused"), "{log}");
+}
+
+#[tokio::test]
+async fn an_elevated_script_is_launched_directly_when_sudo_is_disabled() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        tmp_dir.clone(),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::enabled(false),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope {
+        request,
+        mut reply_to,
+    } = recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+        .await
+        .expect("script request expected");
+    assert_eq!(request.command, "tedge");
+    assert_eq!(request.args, ["service", "restart", "nginx"]);
+    reply_to.send(Ok(script_output(0, ""))).await.unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "successful",
+    )
+    .await;
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(log.contains("----- $ tedge service restart nginx"), "{log}");
+}
+
+#[tokio::test]
+async fn a_missing_sudo_is_reported_in_the_operation_log() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        tmp_dir.clone(),
+        ELEVATED_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::with_program("no-such-sudo-program"),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init","action":"restart","serviceName":"nginx"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope {
+        request,
+        mut reply_to,
+    } = recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+        .await
+        .expect("script request expected");
+    assert_eq!(request.command, "tedge");
+    reply_to.send(Ok(script_output(0, ""))).await.unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "successful",
+    )
+    .await;
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(
+        log.contains("WARNING: `sudo.enable` set to `true`, but sudo not found in $PATH"),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn an_elevated_background_script_moves_on_before_being_launched() {
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_elevated_workflow(
+        tmp_dir.clone(),
+        ELEVATED_BACKGROUND_SCRIPT_WORKFLOW,
+        SudoCommandBuilder::with_program("echo"),
+    )
+    .await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/elevated/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "restarting",
+    )
+    .await;
+
+    let RequestEnvelope {
+        request,
+        mut reply_to,
+    } = recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+        .await
+        .expect("script request expected");
+    assert_eq!(request.args, ["-n", "--", "reboot"]);
+    reply_to.send(Ok(script_output(0, ""))).await.unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/elevated/1",
+        "successful",
+    )
+    .await;
+
+    let SudoResolution::Sudo(echo) = SudoCommandBuilder::with_program("echo").resolve() else {
+        panic!("echo expected in $PATH");
+    };
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-elevated-1.log")).unwrap();
+    assert!(
+        log.contains(&format!("----- $ {echo} -n -- reboot")),
+        "{log}"
+    );
+}
+
+#[tokio::test]
+async fn the_command_line_of_an_input_script_is_logged() {
+    let workflow = r#"
+operation = "outer"
+
+[init]
+action = "proceed"
+on_success = "executing"
+
+[executing]
+operation = "inner"
+input_script = "/some/input.sh ${.payload.x}"
+on_exec = "awaiting"
+
+[awaiting]
+action = "await-operation-completion"
+on_success = "successful"
+on_error = "failed"
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#;
+    let tmp_dir = Arc::new(TempTedgeDir::new());
+    let TestHandler {
+        mut mqtt_box,
+        mut script_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        tmp_dir.clone(),
+        "device/main//",
+        vec![("outer.toml".to_string(), workflow.to_string())],
+        FakeEntityStore::Entities(vec![]),
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/outer/1"),
+            r#"{"status":"init","x":"42"}"#,
+        ))
+        .await
+        .unwrap();
+
+    let RequestEnvelope { mut reply_to, .. } =
+        recv_or_fail_on_actor_exit(&mut script_box, &mut actor_handle, "script request")
+            .await
+            .expect("script request expected");
+    reply_to
+        .send(Ok(script_output(
+            0,
+            ":::begin-tedge:::\n{}\n:::end-tedge:::\n",
+        )))
+        .await
+        .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/outer/1",
+        "awaiting",
+    )
+    .await;
+
+    let log = std::fs::read_to_string(tmp_dir.path().join("workflow-outer-1.log")).unwrap();
+    assert!(log.contains("----- $ /some/input.sh 42"), "{log}");
+}
+
+#[tokio::test]
+async fn an_init_command_for_a_registered_service_of_this_device_moves_to_executing() {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+        FakeEntityStore::Entities(vec![EntityMetadata::new(
+            "device/main/service/collectd".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main/service/collectd/cmd/restart/1"),
+            r#"{"status":"init","serviceName":"collectd","serviceType":"service"}"#,
+        ))
+        .await
+        .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main/service/collectd/cmd/restart/1",
+        "executing",
+    )
+    .await;
+}
+
+#[test_case(
+    FakeEntityStore::Entities(vec![EntityMetadata::new(
+        "device/child01/service/nginx".parse().unwrap(),
+        EntityType::Service,
+    )
+    .with_parent("device/child01//".parse().unwrap())]),
+    "te/device/child01/service/nginx/cmd/restart/1";
+    "a service of another device"
+)]
+#[test_case(
+    FakeEntityStore::Entities(vec![]),
+    "te/device/main/service/collectd/cmd/restart/1";
+    "an entity that is not registered"
+)]
+#[test_case(
+    FakeEntityStore::Failing,
+    "te/device/main/service/collectd/cmd/restart/1";
+    "an entity store that cannot be read"
+)]
+#[tokio::test]
+async fn a_command_is_ignored_if_its_target_is_not_registered_as_a_service_of_this_device(
+    entity_store: FakeEntityStore,
+    command_topic: &str,
+) {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+        entity_store,
+    )
+    .await
+    .unwrap();
+
+    // Consume the builtin restart capability of the device, published on start
+    assert_received_contains_str(&mut mqtt_box, [("te/device/main///cmd/restart", "{}")]).await;
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked(command_topic),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+
+    assert_no_message_or_actor_exit(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "the command is not confirmed to be a service of this device",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_command_is_executed_once_a_failed_lookup_of_its_target_succeeds_on_retry() {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+        FakeEntityStore::FailingOnce(vec![EntityMetadata::new(
+            "device/main/service/collectd".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main/service/collectd/cmd/restart/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main/service/collectd/cmd/restart/1",
+        "executing",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_command_cleared_during_the_lookup_of_its_target_is_not_executed() {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+        FakeEntityStore::FailingOnce(vec![EntityMetadata::new(
+            "device/main/service/collectd".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    // Consume the builtin restart capability of the device, published on start
+    assert_received_contains_str(&mut mqtt_box, [("te/device/main///cmd/restart", "{}")]).await;
+
+    let command_topic = Topic::new_unchecked("te/device/main/service/collectd/cmd/restart/1");
+    mqtt_box
+        .send(MqttMessage::new(&command_topic, r#"{"status":"init"}"#))
+        .await
+        .unwrap();
+    mqtt_box
+        .send(MqttMessage::new(&command_topic, "").with_retain())
+        .await
+        .unwrap();
+
+    assert_no_message_or_actor_exit(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "the command has been cleared",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn a_command_for_this_device_is_processed_while_the_target_of_another_command_is_looked_up() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut restart_box,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![],
+        FakeEntityStore::Unresponsive,
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main/service/collectd/cmd/restart/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/restart/2"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+
+    restart_box
+        .assert_received([RestartCommand {
+            target: "device/main//".parse().unwrap(),
+            cmd_id: "2".to_string(),
+            payload: RestartCommandPayload {
+                status: CommandStatus::Scheduled,
+                log_path: Some(tmp_dir.path().join("workflow-restart-2.log")),
+            },
+        }])
+        .await;
+}
+
+#[tokio::test]
+async fn a_service_workflow_declares_no_capability_of_the_device() {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+        FakeEntityStore::Entities(vec![]),
+    )
+    .await
+    .unwrap();
+
+    // The builtin restart of the device is the only capability published on start
+    assert_received_contains_str(&mut mqtt_box, [("te/device/main///cmd/restart", "{}")]).await;
+    assert_no_message_or_actor_exit(&mut mqtt_box, &mut actor_handle, "the agent has started")
+        .await;
+}
+
+#[tokio::test]
+async fn a_sub_operation_is_triggered_on_the_same_entity_as_the_calling_command() {
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "service-restart.toml".to_string(),
+            SERVICE_RESTART_TRIGGERING_A_SUB_COMMAND.to_string(),
+        )],
+        FakeEntityStore::Entities(vec![EntityMetadata::new(
+            "device/main/service/collectd".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main/service/collectd/cmd/restart/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main/service/collectd/cmd/software_update/sub:restart:1",
+        "init",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn restarting_the_agent_restarts_the_process_once() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        "device/main//",
+        vec![(
+            "agent-restart.toml".to_string(),
+            AGENT_SELF_RESTART_WORKFLOW.to_string(),
+        )],
+        FakeEntityStore::Entities(vec![EntityMetadata::new(
+            "device/main/service/tedge-agent".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main/service/tedge-agent/cmd/restart/1"),
+            json!({"status": "init", "serviceName": "tedge-agent", "serviceType": "service"})
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // The state awaiting the restart is persisted before the process stops
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main/service/tedge-agent/cmd/restart/1",
+        "await-agent-restart",
+    )
+    .await;
+    assert!(
+        matches!(actor_handle.await, Ok(Err(RuntimeError::RestartRequired))),
+        "the agent is expected to ask for a process restart"
+    );
+
+    // On restart, the awaited restart is over: the command completes without being run again
+    let TestHandler {
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        tmp_dir,
+        "device/main//",
+        vec![(
+            "agent-restart.toml".to_string(),
+            AGENT_SELF_RESTART_WORKFLOW.to_string(),
+        )],
+        FakeEntityStore::Entities(vec![EntityMetadata::new(
+            "device/main/service/tedge-agent".parse().unwrap(),
+            EntityType::Service,
+        )
+        .with_parent("device/main//".parse().unwrap())]),
+    )
+    .await
+    .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main/service/tedge-agent/cmd/restart/1",
+        "successful",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn software_list_interrupted_by_an_agent_restart_is_run_again_on_resume() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut software_box,
+        mut actor_handle,
+        ..
+    } = spawn_mqtt_operation_converter("device/main//", vec![])
+        .await
+        .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/software_list/1"),
+            json!({"status": "init"}).to_string(),
+        ))
+        .await
+        .unwrap();
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/software_list/1",
+        "executing",
+    )
+    .await;
+
+    // The request reaches the software manager, which is stopped before responding,
+    // as when the agent restarts after updating itself
+    assert!(matches!(
+        software_box.recv().await,
+        Some(SoftwareCommand::SoftwareListCommand(_))
+    ));
+    actor_handle.abort();
+    let _ = actor_handle.await;
+
+    let TestHandler {
+        mut mqtt_box,
+        mut software_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        tmp_dir,
+        "device/main//",
+        vec![],
+        FakeEntityStore::Entities(vec![]),
+    )
+    .await
+    .unwrap();
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/software_list/1",
+        "executing",
+    )
+    .await;
+
+    let resumed = software_box.recv().await;
+    assert!(
+        matches!(&resumed, Some(SoftwareCommand::SoftwareListCommand(cmd)) if cmd.cmd_id == "1"),
+        "Expected the interrupted software_list request to be sent again to the software manager, got {resumed:?}"
+    );
+}
+
+#[tokio::test]
+async fn software_list_of_a_legacy_builtin_workflow_interrupted_by_an_agent_restart_is_run_again_on_resume(
+) {
+    let workflow = r#"
+operation = "software_list"
+
+[init]
+action = "proceed"
+on_success = "scheduled"
+
+[scheduled]
+action = "builtin"
+on_success = "executing"
+
+[executing]
+action = "builtin"
+on_success = "successful"
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#;
+    let workflows = vec![("software_list.toml".to_string(), workflow.to_string())];
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut software_box,
+        actor_handle,
+        ..
+    } = spawn_mqtt_operation_converter("device/main//", workflows.clone())
+        .await
+        .unwrap();
+
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/software_list/1"),
+            json!({"status": "init"}).to_string(),
+        ))
+        .await
+        .unwrap();
+
+    // The software manager starts the request, then is stopped before completing it,
+    // as when the agent restarts after updating itself
+    let Some(SoftwareCommand::SoftwareListCommand(request)) = software_box.recv().await else {
+        panic!("Expected a software_list request");
+    };
+    software_box
+        .send(request.with_status(CommandStatus::Executing).into())
+        .await
+        .unwrap();
+    let executing = software_box.recv().await;
+    assert!(
+        matches!(&executing, Some(SoftwareCommand::SoftwareListCommand(cmd)) if cmd.status() == CommandStatus::Executing),
+        "Expected the executing state to be forwarded to the software manager, got {executing:?}"
+    );
+    actor_handle.abort();
+    let _ = actor_handle.await;
+
+    let TestHandler {
+        mut mqtt_box,
+        mut software_box,
+        mut actor_handle,
+        ..
+    } = spawn_workflow_actor(
+        tmp_dir,
+        "device/main//",
+        workflows,
+        FakeEntityStore::Entities(vec![]),
+    )
+    .await
+    .unwrap();
+
+    recv_command_state_with_status(
+        &mut mqtt_box,
+        &mut actor_handle,
+        "te/device/main///cmd/software_list/1",
+        "scheduled",
+    )
+    .await;
+
+    // Only a scheduled request is processed by the software manager
+    let resumed = software_box.recv().await;
+    assert!(
+        matches!(&resumed, Some(SoftwareCommand::SoftwareListCommand(cmd)) if cmd.cmd_id == "1" && cmd.status() == CommandStatus::Scheduled),
+        "Expected the interrupted software_list request to be scheduled again on the software manager, got {resumed:?}"
+    );
+}
+
+#[tokio::test]
+async fn each_operation_of_an_array_is_declared_and_cleared_when_removed_from_the_file() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut inotify_box,
+        ..
+    } = spawn_mqtt_operation_converter(
+        "device/main//",
+        vec![(
+            "locks.toml".to_string(),
+            LOCK_AND_UNLOCK_HELD_IN_EXECUTING.to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_received_contains_str(
+        &mut mqtt_box,
+        [
+            ("te/device/main///cmd/lock", "{}"),
+            ("te/device/main///cmd/restart", "{}"),
+            ("te/device/main///cmd/unlock", "{}"),
+        ],
+    )
+    .await;
+
+    let workflow = tmp_dir
+        .dir("operations")
+        .file("locks.toml")
+        .with_raw_content(
+            r#"
+operation = ["lock"]
+
+[init]
+action = "proceed"
+on_success = "executing"
+"#,
+        );
+    inotify_box
+        .send(FsWatchEvent::Modified(workflow.path_buf().into()))
+        .await
+        .unwrap();
+    mqtt_box
+        .assert_received([
+            MqttMessage::new(&Topic::new_unchecked("te/device/main///cmd/lock"), "{}")
+                .with_retain(),
+            MqttMessage::new(&Topic::new_unchecked("te/device/main///cmd/unlock"), "")
+                .with_retain(),
+        ])
+        .await;
+
+    let path = workflow.path_buf();
+    workflow.delete();
+    inotify_box
+        .send(FsWatchEvent::FileDeleted(path.into()))
+        .await
+        .unwrap();
+    mqtt_box
+        .assert_received([
+            MqttMessage::new(&Topic::new_unchecked("te/device/main///cmd/lock"), "").with_retain(),
+        ])
+        .await;
+}
+
+#[tokio::test]
+async fn each_operation_of_an_array_keeps_its_own_copy_of_the_workflow_in_use() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut actor_handle,
+        ..
+    } = spawn_mqtt_operation_converter(
+        "device/main//",
+        vec![(
+            "locks.toml".to_string(),
+            LOCK_AND_UNLOCK_HELD_IN_EXECUTING.to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    for topic in [
+        "te/device/main///cmd/lock/1",
+        "te/device/main///cmd/unlock/2",
+    ] {
+        mqtt_box
+            .send(MqttMessage::new(
+                &Topic::new_unchecked(topic),
+                r#"{"status":"init"}"#,
+            ))
+            .await
+            .unwrap();
+        recv_command_state_with_status(&mut mqtt_box, &mut actor_handle, topic, "executing").await;
+    }
+
+    let version = sha256::digest(LOCK_AND_UNLOCK_HELD_IN_EXECUTING);
+    let in_use_dir = tmp_dir
+        .path()
+        .join("running-operations")
+        .join("workflows-in-use");
+    assert!(in_use_dir.join(format!("lock-{version}.toml")).exists());
+    assert!(in_use_dir.join(format!("unlock-{version}.toml")).exists());
+}
+
+#[tokio::test]
+async fn an_operation_is_kept_when_a_copy_of_its_workflow_file_is_removed() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut inotify_box,
+        ..
+    } = spawn_mqtt_operation_converter(
+        "device/main//",
+        vec![(
+            "locks.toml".to_string(),
+            LOCK_AND_UNLOCK_HELD_IN_EXECUTING.to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_received_contains_str(
+        &mut mqtt_box,
+        [
+            ("te/device/main///cmd/lock", "{}"),
+            ("te/device/main///cmd/restart", "{}"),
+            ("te/device/main///cmd/unlock", "{}"),
+        ],
+    )
+    .await;
+
+    let copy = tmp_dir
+        .dir("operations")
+        .file("locks_copy.toml")
+        .with_raw_content(LOCK_AND_UNLOCK_HELD_IN_EXECUTING);
+    inotify_box
+        .send(FsWatchEvent::Modified(copy.path_buf().into()))
+        .await
+        .unwrap();
+    assert_received_contains_str(
+        &mut mqtt_box,
+        [
+            ("te/device/main///cmd/lock", "{}"),
+            ("te/device/main///cmd/unlock", "{}"),
+        ],
+    )
+    .await;
+
+    let path = copy.path_buf();
+    copy.delete();
+    inotify_box
+        .send(FsWatchEvent::FileDeleted(path.into()))
+        .await
+        .unwrap();
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/lock/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_received_contains_str(
+        &mut mqtt_box,
+        [("te/device/main///cmd/lock/1", r#""status":"executing""#)],
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn the_builtin_workflow_is_not_restored_while_a_file_still_defines_the_operation() {
+    let TestHandler {
+        tmp_dir,
+        mut mqtt_box,
+        mut inotify_box,
+        ..
+    } = spawn_mqtt_operation_converter(
+        "device/main//",
+        // Not `restart.toml`: on a new command, the agent reads `<operation>.toml` when no file is known for the operation.
+        vec![(
+            "custom_restart.toml".to_string(),
+            RESTART_HELD_IN_EXECUTING.to_string(),
+        )],
+    )
+    .await
+    .unwrap();
+
+    assert_received_contains_str(&mut mqtt_box, [("te/device/main///cmd/restart", "{}")]).await;
+
+    let other = tmp_dir
+        .dir("operations")
+        .file("other_restart.toml")
+        .with_raw_content(
+            r#"
+operation = "restart"
+
+[init]
+action = "proceed"
+on_success = "successful"
+"#,
+        );
+    inotify_box
+        .send(FsWatchEvent::Modified(other.path_buf().into()))
+        .await
+        .unwrap();
+    assert_received_contains_str(&mut mqtt_box, [("te/device/main///cmd/restart", "{}")]).await;
+
+    let path = other.path_buf();
+    other.delete();
+    inotify_box
+        .send(FsWatchEvent::FileDeleted(path.into()))
+        .await
+        .unwrap();
+    mqtt_box
+        .send(MqttMessage::new(
+            &Topic::new_unchecked("te/device/main///cmd/restart/1"),
+            r#"{"status":"init"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_received_contains_str(
+        &mut mqtt_box,
+        [("te/device/main///cmd/restart/1", r#""status":"executing""#)],
+    )
+    .await;
+}
+
 struct TestHandler {
     tmp_dir: Arc<TempTedgeDir>,
     actor_handle: JoinHandle<Result<(), RuntimeError>>,
     mqtt_box: TimedMessageBox<SimpleMessageBox<MqttMessage, MqttMessage>>,
     software_box: TimedMessageBox<SimpleMessageBox<SoftwareCommand, SoftwareCommand>>,
     restart_box: TimedMessageBox<SimpleMessageBox<RestartCommand, RestartCommand>>,
-    _inotify_box: TimedMessageBox<SimpleMessageBox<NoMessage, FsWatchEvent>>,
+    inotify_box: TimedMessageBox<SimpleMessageBox<NoMessage, FsWatchEvent>>,
     downloader_box: TimedMessageBox<
         SimpleMessageBox<RequestEnvelope<DownloaderRequest, DownloaderResult>, NoMessage>,
     >,
@@ -1089,11 +2331,89 @@ struct TestHandler {
         SimpleMessageBox<RequestEnvelope<OperationStepRequest, OperationStepResponse>, NoMessage>,
     >,
     sync_signal_box: TimedMessageBox<SimpleMessageBox<CmdMetaSyncSignal, NoMessage>>,
+    script_box: TimedMessageBox<
+        SimpleMessageBox<RequestEnvelope<Execute, std::io::Result<Output>>, NoMessage>,
+    >,
+}
+
+/// A fake entity store, answering the entity lookups of the workflow actor over HTTP
+enum FakeEntityStore {
+    /// Serve the given entities, answering `404` for any other
+    Entities(Vec<EntityMetadata>),
+    /// Answer `500` to every request, as an entity store that cannot be queried
+    Failing,
+    FailingOnce(Vec<EntityMetadata>),
+    Unresponsive,
+}
+
+impl FakeEntityStore {
+    async fn serve(self, mut http: FakeServerBox<HttpRequest, HttpResult>) {
+        let mut failed_once = false;
+        while let Some(request) = http.recv().await {
+            let response = match &self {
+                FakeEntityStore::Unresponsive => continue,
+                FakeEntityStore::Failing => HttpResponseBuilder::new().status(500).build(),
+                FakeEntityStore::FailingOnce(_) if !failed_once => {
+                    failed_once = true;
+                    HttpResponseBuilder::new().status(500).build()
+                }
+                FakeEntityStore::Entities(entities) | FakeEntityStore::FailingOnce(entities) => {
+                    let target = request
+                        .uri()
+                        .path()
+                        .strip_prefix("/te/v1/entities/")
+                        .and_then(|path| path.parse::<EntityTopicId>().ok());
+                    match entities
+                        .iter()
+                        .find(|entity| Some(&entity.topic_id) == target.as_ref())
+                    {
+                        Some(entity) => HttpResponseBuilder::new().status(200).json(entity).build(),
+                        None => HttpResponseBuilder::new().status(404).build(),
+                    }
+                }
+            };
+            if http.send(response).await.is_err() {
+                break;
+            }
+        }
+    }
 }
 
 async fn spawn_mqtt_operation_converter(
     device_topic_id: &str,
     workflows: Vec<(String, String)>,
+) -> Result<TestHandler, DynError> {
+    spawn_workflow_actor(
+        Arc::new(TempTedgeDir::new()),
+        device_topic_id,
+        workflows,
+        FakeEntityStore::Entities(vec![]),
+    )
+    .await
+}
+
+async fn spawn_workflow_actor(
+    tmp_dir: Arc<TempTedgeDir>,
+    device_topic_id: &str,
+    workflows: Vec<(String, String)>,
+    entity_store: FakeEntityStore,
+) -> Result<TestHandler, DynError> {
+    spawn_workflow_actor_with_sudo(
+        tmp_dir,
+        device_topic_id,
+        workflows,
+        entity_store,
+        SudoCommandBuilder::enabled(false),
+    )
+    .await
+}
+
+async fn spawn_workflow_actor_with_sudo(
+    tmp_dir: Arc<TempTedgeDir>,
+    device_topic_id: &str,
+    workflows: Vec<(String, String)>,
+    entity_store: FakeEntityStore,
+    sudo: SudoCommandBuilder,
 ) -> Result<TestHandler, DynError> {
     let mut software_builder = SoftwareActor(SimpleMessageBoxBuilder::new("Software", 5));
     let mut restart_builder = RestartActor(SimpleMessageBoxBuilder::new("Restart", 5));
@@ -1102,7 +2422,7 @@ async fn spawn_mqtt_operation_converter(
         SyncListenerActorBuilder(SimpleMessageBoxBuilder::new("SyncListener", 5));
 
     let mut mqtt_builder: SimpleMessageBoxBuilder<MqttMessage, MqttMessage> =
-        SimpleMessageBoxBuilder::new("MQTT", 5);
+        SimpleMessageBoxBuilder::new("MQTT", 32);
     let mut script_builder: SimpleMessageBoxBuilder<
         RequestEnvelope<Execute, std::io::Result<Output>>,
         NoMessage,
@@ -1117,17 +2437,20 @@ async fn spawn_mqtt_operation_converter(
         RequestEnvelope<UploaderRequest, UploaderResult>,
         NoMessage,
     > = SimpleMessageBoxBuilder::new("Uploader", 5);
+    let mut http_builder = FakeServerBox::<HttpRequest, HttpResult>::builder();
 
-    let tmp_dir = Arc::new(TempTedgeDir::new());
     let tmp_path = tmp_dir.path();
     let config_root = TedgePaths::from_root_with_defaults(tmp_path, "", "");
     let operations_dir = tmp_dir.dir("operations");
+
+    tmp_dir.dir("running-operations");
     for (file_name, content) in workflows {
         operations_dir.file(&file_name).with_raw_content(&content);
     }
     let device_topic_id = device_topic_id
         .parse::<EntityTopicId>()
         .expect("Invalid topic id");
+
     let service_topic_id = device_topic_id
         .default_service_for_device("tedge-agent")
         .expect("Invalid service topic id");
@@ -1143,7 +2466,12 @@ async fn spawn_mqtt_operation_converter(
         operations_dir: config_root.dir("operations").unwrap(),
         tmp_dir: TedgePaths::from_root_with_defaults(tmp_path.join(tmp_path), "", ""),
         capabilities: Capabilities::default(),
+        sudo,
     };
+    let entity_store_client = EntityStoreClient::remote(
+        EntityStoreUrls::new("127.0.0.1:8000".into(), Protocol::Http),
+        &mut http_builder,
+    );
     let mut workflow_actor_builder = WorkflowActorBuilder::new(
         config,
         &mut mqtt_builder,
@@ -1151,6 +2479,7 @@ async fn spawn_mqtt_operation_converter(
         &mut inotify_builder,
         &mut downloade_builder,
         &mut uploader_builder,
+        entity_store_client,
     );
     workflow_actor_builder.register_builtin_operation(&mut restart_builder);
     workflow_actor_builder.register_builtin_operation(&mut software_builder);
@@ -1168,7 +2497,10 @@ async fn spawn_mqtt_operation_converter(
     let mqtt_box = mqtt_builder.build().with_timeout(TEST_TIMEOUT_MS);
     let downloader_box = downloade_builder.build().with_timeout(TEST_TIMEOUT_MS);
     let uploader_box = uploader_builder.build().with_timeout(TEST_TIMEOUT_MS);
-    let _inotify_box = inotify_builder.build().with_timeout(TEST_TIMEOUT_MS);
+    let inotify_box = inotify_builder.build().with_timeout(TEST_TIMEOUT_MS);
+    let script_box = script_builder.build().with_timeout(TEST_TIMEOUT_MS);
+
+    tokio::spawn(entity_store.serve(http_builder.build()));
 
     let workflow_actor = workflow_actor_builder.build();
     let tmp_dir_guard = Arc::clone(&tmp_dir);
@@ -1184,12 +2516,29 @@ async fn spawn_mqtt_operation_converter(
         mqtt_box,
         software_box,
         restart_box,
-        _inotify_box,
+        inotify_box,
         downloader_box,
         uploader_box,
         config_box,
         sync_signal_box,
+        script_box,
     })
+}
+
+async fn spawn_elevated_workflow(
+    tmp_dir: Arc<TempTedgeDir>,
+    workflow: &str,
+    sudo: SudoCommandBuilder,
+) -> TestHandler {
+    spawn_workflow_actor_with_sudo(
+        tmp_dir,
+        "device/main//",
+        vec![("elevated.toml".to_string(), workflow.to_string())],
+        FakeEntityStore::Entities(vec![]),
+        sudo,
+    )
+    .await
+    .unwrap()
 }
 
 async fn skip_capability_messages(mqtt: &mut impl MessageReceiver<MqttMessage>, device: &str) {
@@ -1274,6 +2623,15 @@ async fn assert_no_message_or_actor_exit<T>(
                 Err(err) => panic!("workflow actor panicked while {context}: {err}"),
             }
         }
+    }
+}
+
+fn script_output(code: i32, stdout: &str) -> Output {
+    use std::os::unix::process::ExitStatusExt;
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: stdout.as_bytes().to_vec(),
+        stderr: vec![],
     }
 }
 
@@ -1384,3 +2742,113 @@ impl SyncOnCommand for SyncListenerActorBuilder {
         vec![OperationType::ConfigUpdate]
     }
 }
+
+const SERVICE_RESTART_HELD_IN_EXECUTING: &str = r#"
+operation = "restart"
+type = "service"
+
+[init]
+action = "proceed"
+on_success = "executing"
+"#;
+
+const AGENT_SELF_RESTART_WORKFLOW: &str = r#"
+operation = "restart"
+type = "service"
+
+[init]
+action = "proceed"
+on_success = "restart-agent"
+
+[restart-agent]
+action = "restart-agent"
+on_exec = "await-agent-restart"
+
+[await-agent-restart]
+action = "await-agent-restart"
+timeout_second = 90
+on_success = "successful"
+on_timeout = { status = "failed", reason = "tedge-agent did not restart in time" }
+
+[successful]
+action = "cleanup"
+"#;
+
+const SERVICE_RESTART_TRIGGERING_A_SUB_COMMAND: &str = r#"
+operation = "restart"
+type = "service"
+
+[init]
+action = "proceed"
+on_success = "executing"
+
+[executing]
+operation = "software_update"
+on_exec = "awaiting_sub_command"
+
+[awaiting_sub_command]
+action = "await-operation-completion"
+on_success = "successful"
+on_error = "failed"
+"#;
+
+const LOCK_AND_UNLOCK_HELD_IN_EXECUTING: &str = r#"
+operation = ["lock", "unlock"]
+
+[init]
+action = "proceed"
+on_success = "executing"
+"#;
+
+const RESTART_HELD_IN_EXECUTING: &str = r#"
+operation = "restart"
+
+[init]
+action = "proceed"
+on_success = "executing"
+"#;
+
+const ELEVATED_SCRIPT_WORKFLOW: &str = r#"
+operation = "elevated"
+
+[init]
+action = "proceed"
+on_success = "executing"
+
+[executing]
+script = "tedge service ${.payload.action} ${.payload.serviceName}"
+sudo = true
+timeout_second = 60
+on_exit.0 = "successful"
+on_exit.2 = { status = "failed", reason = "not supported" }
+on_exit._ = "failed"
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#;
+
+const ELEVATED_BACKGROUND_SCRIPT_WORKFLOW: &str = r#"
+operation = "elevated"
+
+[init]
+action = "proceed"
+on_success = "executing"
+
+[executing]
+background_script = "reboot"
+sudo = true
+on_exec = "restarting"
+
+[restarting]
+action = "proceed"
+on_success = "successful"
+
+[successful]
+action = "cleanup"
+
+[failed]
+action = "cleanup"
+"#;

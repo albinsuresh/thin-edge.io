@@ -417,16 +417,6 @@ impl EntityStore {
         Ok(removed_entities)
     }
 
-    pub fn get_twin_fragment(
-        &self,
-        topic_id: &EntityTopicId,
-        fragment_key: &str,
-    ) -> Option<&JsonValue> {
-        self.entities
-            .get(topic_id)
-            .and_then(|entity| entity.twin_data.get(fragment_key))
-    }
-
     /// Updates the entity twin data with the provided fragment data.
     /// Returns `true`, if the twin data got updated with the new fragment value.
     /// If the provided fragment already existed, `false` is returned.
@@ -464,14 +454,6 @@ impl EntityStore {
         }
 
         Ok(true)
-    }
-
-    pub fn get_twin_fragments(
-        &mut self,
-        topic_id: &EntityTopicId,
-    ) -> Result<&Map<String, JsonValue>, entity_store::Error> {
-        let entity = self.try_get(topic_id)?;
-        Ok(&entity.twin_data)
     }
 
     pub fn set_twin_fragments(
@@ -1313,7 +1295,7 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .root("device/child2//".parse().unwrap()), 
+            .root("device/child2//".parse().unwrap()),
         BTreeSet::from([
             "device/child2//",
             "device/child2/service/service20",
@@ -1330,7 +1312,7 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .parent("device/child2//".parse().unwrap()), 
+            .parent("device/child2//".parse().unwrap()),
         BTreeSet::from([
             "device/child2/service/service20",
             "device/child2/service/service21",
@@ -1342,7 +1324,7 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .r#type(EntityType::ChildDevice), 
+            .r#type(EntityType::ChildDevice),
         BTreeSet::from([
             "device/child0//",
             "device/child1//",
@@ -1360,7 +1342,7 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .r#type(EntityType::Service), 
+            .r#type(EntityType::Service),
         BTreeSet::from([
             "device/main/service/service0",
             "device/main/service/service1",
@@ -1374,7 +1356,7 @@ mod tests {
     #[test_case(
         ListFilters::default()
             .root("device/child2//".parse().unwrap())
-            .r#type(EntityType::ChildDevice), 
+            .r#type(EntityType::ChildDevice),
         BTreeSet::from([
             "device/child2//",
             "device/child20//",
@@ -1389,7 +1371,7 @@ mod tests {
     #[test_case(
         ListFilters::default()
             .parent("device/child2//".parse().unwrap())
-            .r#type(EntityType::ChildDevice), 
+            .r#type(EntityType::ChildDevice),
         BTreeSet::from([
             "device/child20//",
             "device/child21//",
@@ -1399,19 +1381,19 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .parent("device/child2/service/service20".parse().unwrap()), 
+            .parent("device/child2/service/service20".parse().unwrap()),
         BTreeSet::new();
         "children_of_service_is_empty"
     )]
     #[test_case(
         ListFilters::default()
-            .parent("device/child2100//".parse().unwrap()), 
+            .parent("device/child2100//".parse().unwrap()),
         BTreeSet::new();
         "children_of_leaf_child_is_empty"
     )]
     #[test_case(
         ListFilters::default()
-            .root("device/child2100//".parse().unwrap()), 
+            .root("device/child2100//".parse().unwrap()),
         BTreeSet::from([
             "device/child2100//",
         ]);
@@ -1419,7 +1401,7 @@ mod tests {
     )]
     #[test_case(
         ListFilters::default()
-            .root("device/child2/service/service20".parse().unwrap()), 
+            .root("device/child2/service/service20".parse().unwrap()),
         BTreeSet::from([
             "device/child2/service/service20",
         ]);
@@ -2125,7 +2107,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            store.get_twin_fragment(&topic_id, "foo"),
+            store.get(&topic_id).unwrap().twin_data.get("foo"),
             Some(&json!("bar"))
         );
 
@@ -2151,7 +2133,7 @@ mod tests {
 
         let store = new_entity_store(&temp_dir, false);
 
-        assert_eq!(store.get_twin_fragment(&topic_id, "foo"), None);
+        assert_eq!(store.get(&topic_id).unwrap().twin_data.get("foo"), None);
     }
 
     #[test]

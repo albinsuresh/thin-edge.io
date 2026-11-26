@@ -22,6 +22,7 @@ futures = { workspace = true }
 http-body = { workspace = true }
 http-body-util = { workspace = true }
 hyper = { workspace = true }
+percent-encoding = { workspace = true }
 pin-project = { workspace = true }
 reqwest = { workspace = true, features = ["stream"] }
 rustls = { workspace = true }
@@ -43,7 +44,9 @@ env_logger = { workspace = true }
 httparse = { workspace = true }
 mockito = { workspace = true }
 rcgen = { workspace = true }
+rstest = { workspace = true }
 test-case = { workspace = true }
+tokio-rustls = { workspace = true }
 
 [lints]
 workspace = true

@@ -635,10 +635,11 @@ on_exit._ = "oops"
 
     #[test]
     fn error_messages_capture_script_killing_signal() {
-        let script = ShellScript::from_str("sh -c 'kill -11 $$'").unwrap();
+        // SIGKILL, not a signal like SIGSEGV that dumps a core file in the crate directory
+        let script = ShellScript::from_str("sh -c 'kill -9 $$'").unwrap();
         assert_eq!(
             extract_json_output("user-script", script.output()),
-            Err("Program `user-script` has been killed by SIG11".to_string())
+            Err("Program `user-script` has been killed by SIG9".to_string())
         );
     }
 
@@ -804,7 +805,7 @@ timeout_second = 15
     }
 
     fn script_from_toml(file: &str) -> (ShellScript, ExitHandlers) {
-        if let OperationAction::Script(script, handlers) =
+        if let OperationAction::Script(script, _, handlers) =
             toml::from_str(file).expect("Expect TOML input")
         {
             return (script, handlers);
@@ -834,8 +835,8 @@ script = "some-script"
 {handlers}
 "#
         );
-        let workflow: OperationWorkflow = toml::from_str(&file).expect("Expect TOML input");
-        if let Some(OperationAction::Script(_, handlers)) = workflow.states.get("init") {
+        let workflow = OperationWorkflow::from_toml(&file);
+        if let Some(OperationAction::Script(_, _, handlers)) = workflow.states.get("init") {
             return handlers.clone();
         }
 

@@ -587,6 +587,8 @@ fn update_with_environment_variables(
         let tedge_key = match key.strip_prefix("TEDGE_") {
             Some("CONFIG_DIR") => continue,
             Some("CLOUD_PROFILE") => continue,
+            // `mappers.*` keys belong to the mapper config engine, which reads these itself
+            Some(tedge_key) if tedge_key.starts_with("MAPPERS_") => continue,
             Some(tedge_key) => match parse_key_without_warnings(tedge_key) {
                 Ok(key) => key,
                 Err(_) => {
@@ -682,10 +684,12 @@ enum StoreEmptyConfig {
 #[cfg(test)]
 mod tests {
     use crate::models::AbsolutePath;
+    use crate::models::MqttPayloadLimit;
     use crate::tedge_toml::mapper_config::AzMapperSpecificConfig;
     use crate::tedge_toml::mapper_config::C8yMapperSpecificConfig;
     use crate::tedge_toml::Cloud;
     use once_cell::sync::Lazy;
+    use rstest::rstest;
     use tedge_config_macros::ProfileName;
     use tedge_test_utils::fs::TempTedgeDir;
     use tokio::sync::Mutex;
@@ -870,6 +874,21 @@ type = "a-service-type""#;
             "Verify that c8y/mapper.toml file has actually been read"
         );
         assert_eq!(c8y_config.root_cert_path.to_string(), "/root/cert/path");
+    }
+
+    #[tokio::test]
+    async fn mapper_environment_variables_are_not_reported_as_unknown_keys() {
+        let mut env = EnvSandbox::new().await;
+        env.set_var("TEDGE_MAPPERS_THINGSBOARD_URL", "example.com:8883");
+        let mut warnings = UnusedValueWarnings(vec![]);
+
+        update_with_environment_variables(&mut TEdgeConfigDto::default(), &mut warnings).unwrap();
+
+        assert!(
+            warnings.0.iter().all(|w| !w.contains("TEDGE_MAPPERS_")),
+            "{:?}",
+            warnings.0
+        );
     }
 
     #[tokio::test]
@@ -1799,6 +1818,35 @@ config = "KeepOld"
         assert_eq!(
             tedge_config.apt.dpkg.options.config,
             crate::models::AptConfig::KeepOld
+        );
+    }
+
+    #[rstest]
+    #[case::c8y_zero("[c8y.mapper.mqtt]\nmax_payload_size = 0")]
+    #[case::c8y_above_max("[c8y.mapper.mqtt]\nmax_payload_size = 268435456")]
+    #[case::az_zero("[az.mapper.mqtt]\nmax_payload_size = 0")]
+    #[case::aws_above_max("[aws.mapper.mqtt]\nmax_payload_size = 268435456")]
+    #[tokio::test]
+    async fn out_of_range_max_payload_size_in_tedge_toml_is_rejected(#[case] toml: &str) {
+        let (_dir, t) = create_temp_tedge_config(toml).unwrap();
+        let err = t.load_dto_with_warnings::<FileOnly>().await.unwrap_err();
+        let TEdgeConfigError::FromTOMLParse(err) = err else {
+            panic!("expected a TOML parse error, got {err:?}");
+        };
+        assert!(
+            err.to_string().contains("Invalid MQTT payload size limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn max_payload_size_in_range_is_read_from_tedge_toml() {
+        let (_dir, t) =
+            create_temp_tedge_config("[c8y.mapper.mqtt]\nmax_payload_size = 16384").unwrap();
+        let (dto, _warnings) = t.load_dto_with_warnings::<FileOnly>().await.unwrap();
+        assert_eq!(
+            dto.c8y.non_profile.mapper.mqtt.max_payload_size,
+            Some(MqttPayloadLimit(16384))
         );
     }
 
